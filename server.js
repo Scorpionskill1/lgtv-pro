@@ -196,10 +196,9 @@ const TV_UI_HTML = `<!DOCTYPE html>
   .card-sub { padding: 0 10px 8px; font-size: 13px; color: #94a3b8; height: 24px; overflow: hidden; }
   #modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(5,8,15,0.95); padding: 36px 56px; z-index: 50; overflow-y: auto; }
   #modalTitle { font-size: 30px; font-weight: bold; margin-bottom: 10px; color: #fff; }
-  #modalDesc { font-size: 17px; color: #cbd5e1; max-width: 920px; max-height: 110px; overflow: hidden; margin-bottom: 18px; line-height: 1.4; }
+  #modalDesc { font-size: 17px; color: #cbd5e1; max-width: 920px; max-height: 160px; overflow: auto; margin-bottom: 18px; line-height: 1.4; }
   #seriesControls { display: none; margin-bottom: 16px; }
   .ep-btn { display: inline-block; padding: 8px 16px; margin: 0 8px 8px 0; background: #1e293b; color: #fff; font-size: 18px; border-radius: 6px; border: 3px solid transparent; cursor: pointer; }
-  .ep-btn.active { background: #2563eb; }
   .stream-btn { display: block; width: 540px; padding: 13px 20px; margin-bottom: 10px; background: #1e293b; color: #fff; font-size: 20px; border-radius: 6px; border: 3px solid transparent; text-align: left; cursor: pointer; }
   #playerWrap { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #000; z-index: 100; }
   video { width: 100%; height: 100%; }
@@ -383,7 +382,7 @@ function fetchStreamsForModal() {
     document.getElementById("seriesControls").style.display = data.isSeries ? "block" : "none";
     var streams = data.streams || [];
     if (!streams.length) {
-      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">Потоки не найдены (попробуйте другую серию/сезон)</div>';
+      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">Потоки не найдены</div>';
     } else {
       var h = "";
       for (var i = 0; i < streams.length; i++) {
@@ -659,7 +658,12 @@ const server = http.createServer(async (req, res) => {
             const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
             if (parsed.length > 0) streams = parsed;
           }
-        } catch (e) {}
+          if (streams.length === 0) {
+            return sendJson({ streams: [], desc: "AJAX ответ: " + aRes.text.slice(0, 300), isSeries });
+          }
+        } catch (e) {
+          return sendJson({ streams: [], desc: "AJAX не JSON (" + aRes.base + "): " + aRes.text.slice(0, 300), isSeries });
+        }
       }
     }
     return sendJson({ streams, desc, isSeries });
