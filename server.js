@@ -1,889 +1,773 @@
-<!DOCTYPE html>
-<html>
+const http = require("http");
+const crypto = require("crypto");
+
+const PORT = process.env.PORT || 3000;
+const MIRRORS = ["https://rezka.ag", "https://hdrezka.me", "https://rezka-ua.tv"];
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+const cookieJar = {};
+
+function solveAnubis(html) {
+  const m = html.match(/<script[^>]*id="anubis_challenge"[^>]*>([\s\S]*?)<\/script>/i);
+  if (!m) return null;
+  const parsed = JSON.parse(m[1]);
+  const ch = parsed.challenge || parsed;
+  const challengeStr = ch.randomData;
+  const challengeId = ch.id;
+  if (!challengeStr || !challengeId) return null;
+
+  const difficulty = (parsed.rules && parsed.rules.difficulty) || ch.difficulty || 2;
+  const prefix = "0".repeat(difficulty);
+
+  const t0 = Date.now();
+  let nonce = 0;
+  let hash = "";
+  while (nonce < 5000000) {
+    hash = crypto.createHash("sha256").update(challengeStr + nonce).digest("hex");
+    if (hash.startsWith(prefix)) {
+      return {
+        id: challengeId,
+        response: hash,
+        nonce,
+        elapsedTime: Math.max(10, Date.now() - t0)
+      };
+    }
+    nonce++;
+  }
+  return null;
+}
+
+async function ensureCookie(base) {
+  if (cookieJar[base]) return cookieJar[base];
+  const target = base + "/films/?filter=popular";
+  const res = await fetch(target, {
+    headers: { "User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9", "Referer": base + "/" }
+  });
+  const text = await res.text();
+  if (text.includes("anubis_challenge")) {
+    const initCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
+    const initCookieHeader = initCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
+    const solved = solveAnubis(text);
+    if (solved) {
+      const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(target)}&elapsedTime=${solved.elapsedTime}`;
+      const passRes = await fetch(passUrl, {
+        headers: { "User-Agent": UA, "Referer": target, ...(initCookieHeader ? { Cookie: initCookieHeader } : {}) },
+        redirect: "manual"
+      });
+      const rawCookies = passRes.headers.getSetCookie ? passRes.headers.getSetCookie() : [passRes.headers.get("set-cookie")].filter(Boolean);
+      const authCookie = rawCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
+      if (authCookie) cookieJar[base] = authCookie;
+    }
+  }
+  return cookieJar[base] || "";
+}
+
+async function rezkaRequest(path, opts = {}) {
+  for (const base of MIRRORS) {
+    const target = path.startsWith("http") ? path : base + path;
+    try {
+      let ck = await ensureCookie(base);
+      const makeHeaders = (cookieVal) => ({
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": base,
+        "Referer": base + "/",
+        ...(cookieVal ? { Cookie: cookieVal } : {}),
+        ...(opts.headers || {})
+      });
+
+      let res = await fetch(target, { ...opts, headers: makeHeaders(ck), redirect: "follow" });
+      let text = await res.text();
+
+      if (text.includes("anubis_challenge")) {
+        delete cookieJar[base];
+        ck = await ensureCookie(base);
+        res = await fetch(target, { ...opts, headers: makeHeaders(ck), redirect: "follow" });
+        text = await res.text();
+      }
+
+      if (res.ok && !text.includes("anubis_challenge")) {
+        return { text, base, ok: true };
+      }
+    } catch (e) {}
+  }
+  return { text: "", base: MIRRORS[0], ok: false };
+}
+
+function decodeRezkaStreams(raw) {
+  if (!raw) return "";
+  const clean = raw.replace(/\\\//g, "/");
+  if (!clean.startsWith("#")) return clean;
+
+  const trash = ["@", "#", "!", "^", "$"];
+  const codes = [];
+  const gen = (k, p = "") => {
+    if (k === 0) { codes.push(Buffer.from(p).toString("base64")); return; }
+    for (const ch of trash) gen(k - 1, p + ch);
+  };
+  gen(2);
+  gen(3);
+
+  let data = clean.substring(2).replace(/\/\/_\/\//g, "");
+  for (const c of codes) data = data.split(c).join("");
+
+  try {
+    return Buffer.from(data, "base64").toString("utf-8");
+  } catch (e) {
+    return "";
+  }
+}
+
+function parseStreams(decoded, origin) {
+  if (!decoded) return [];
+  const list = [];
+  for (const part of decoded.split(",")) {
+    const m = part.trim().match(/^\[([^\]]+)\](.+)$/);
+    if (!m) continue;
+    const q = m[1].trim();
+    const urls = m[2].split(" or ").map((u) => u.trim()).filter(Boolean);
+    const mp4 = urls.find((u) => u.toLowerCase().includes(".mp4"));
+    const hls = urls.find((u) => u.toLowerCase().includes(".m3u8"));
+    const url = mp4 || hls || urls[0];
+    if (url) {
+      list.push({
+        quality: q,
+        isHls: !mp4 && Boolean(hls),
+        name: `HDRezka • ${q} (${mp4 ? "MP4" : "HLS"})`,
+        url: `${origin}/proxy?url=${encodeURIComponent(url)}`
+      });
+    }
+  }
+  const rank = (q) => (q.includes("1080p Ultra") ? 5 : q.includes("1080") ? 4 : q.includes("720") ? 3 : q.includes("480") ? 2 : 1);
+  list.sort((a, b) => rank(b.quality) - rank(a.quality));
+  return list;
+}
+
+function parseCards(html, origin, catType) {
+  const chunks = html.split('<div class="b-content__inline_item"');
+  const items = [];
+  for (let i = 1; i < chunks.length; i++) {
+    const c = chunks[i];
+    const idM = c.match(/data-id="(\d+)"/);
+    const urlM = c.match(/data-url="([^"]+)"/);
+    const imgM = c.match(/<img[^>]+src="([^"]+)"/);
+    const linkM = c.match(/class="b-content__inline_item-link"[\s\S]*?<a[^>]*>([^<]+)<\/a>/);
+    const infoM = c.match(/class="b-content__inline_item-link"[\s\S]*?<div>([^<]+)<\/div>/);
+    if (!idM || !urlM || !linkM) continue;
+
+    const info = infoM ? infoM[1].trim() : "";
+    const yearM = info.match(/\b(19\d\d|20\d\d)\b/);
+    items.push({
+      id: "rz_" + idM[1],
+      type: catType,
+      rezkaUrl: urlM[1],
+      title: linkM[1].trim(),
+      year: yearM ? yearM[1] : "",
+      genres: info,
+      poster: imgM ? `${origin}/proxy?img=1&url=${encodeURIComponent(imgM[1])}` : ""
+    });
+  }
+  return items;
+}
+
+const TV_UI_HTML = `<!DOCTYPE html>
+<html lang="ru">
 <head>
-<meta charset="utf-8" />
-<meta http-equiv="X-UA-Compatible" content="IE=edge" />
-<meta name="viewport" content="width=1280, initial-scale=1.0" />
-<title>LG TV — Lampa & HD IPTV</title>
-<style type="text/css">
-* { margin: 0; padding: 0; }
-html, body {
-    width: 1280px;
-    height: 720px;
-    background-color: #0b0f17;
-    color: #eef3fa;
-    font-family: Arial, Helvetica, sans-serif;
-    overflow: hidden;
-}
-#app {
-    width: 1280px;
-    height: 720px;
-    position: relative;
-}
-#topbar {
-    width: 1232px;
-    height: 62px;
-    padding: 12px 24px 0 24px;
-    background-color: #131a26;
-    border-bottom: 2px solid #233047;
-}
-#brand {
-    float: left;
-    font-size: 24px;
-    font-weight: bold;
-    color: #f5c518;
-    line-height: 44px;
-    margin-right: 24px;
-}
-.tab {
-    float: left;
-    height: 42px;
-    line-height: 42px;
-    padding: 0 18px;
-    margin-right: 10px;
-    background-color: #1b2436;
-    border: 3px solid #2b3a54;
-    color: #a7b6cc;
-    font-size: 18px;
-    font-weight: bold;
-}
-.tab-active {
-    background-color: #253654;
-    color: #ffffff;
-    border-color: #4f78b8;
-}
-#status {
-    float: right;
-    line-height: 44px;
-    font-size: 15px;
-    color: #8fa1bc;
-}
-.panel {
-    width: 1232px;
-    height: 576px;
-    padding: 16px 24px 0 24px;
-    display: none;
-    overflow: hidden;
-    position: relative;
-}
-.panel-vis { display: block; }
-
-/* Сетка ТВ-каналов */
-.card {
-    float: left;
-    width: 222px;
-    height: 154px;
-    margin: 0 20px 20px 0;
-    background-color: #151d2b;
-    border: 4px solid #222e42;
-    position: relative;
-}
-.card-logo {
-    width: 222px;
-    height: 98px;
-    line-height: 98px;
-    text-align: center;
-    font-weight: bold;
-    overflow: hidden;
-}
-.card-logo img {
-    max-width: 140px;
-    max-height: 76px;
-    vertical-align: middle;
-}
-.card-badge {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    padding: 2px 7px;
-    background-color: #0b0f17;
-    color: #f5c518;
-    font-size: 12px;
-    font-weight: bold;
-    border: 1px solid #f5c518;
-}
-.card-num {
-    position: absolute;
-    top: 8px;
-    left: 8px;
-    padding: 2px 6px;
-    background-color: #0b0f17;
-    color: #c5d2e6;
-    font-size: 12px;
-    font-weight: bold;
-}
-.card-name {
-    height: 32px;
-    line-height: 32px;
-    padding: 4px 10px 0 10px;
-    font-size: 17px;
-    font-weight: bold;
-    color: #ffffff;
-    white-space: nowrap;
-    overflow: hidden;
-}
-.card-group {
-    padding: 0 10px;
-    font-size: 13px;
-    color: #8b9db8;
-    white-space: nowrap;
-    overflow: hidden;
-}
-
-/* Вкладка Кино и Поиск */
-.mov-left {
-    float: left;
-    width: 780px;
-    height: 556px;
-    background-color: #121824;
-    border: 2px solid #233047;
-}
-.mov-right {
-    float: right;
-    width: 430px;
-    height: 556px;
-    background-color: #121824;
-    border: 2px solid #233047;
-    padding: 12px;
-    box-sizing: border-box;
-}
-.search-row {
-    padding: 10px;
-    background-color: #171f2e;
-    border-bottom: 2px solid #233047;
-}
-.search-box {
-    display: inline-block;
-    width: 520px;
-    height: 36px;
-    line-height: 36px;
-    padding: 0 12px;
-    background-color: #0b0f17;
-    border: 3px solid #304261;
-    color: #ffffff;
-    font-size: 18px;
-    vertical-align: middle;
-    white-space: nowrap;
-    overflow: hidden;
-}
-.btn-sm {
-    display: inline-block;
-    height: 36px;
-    line-height: 36px;
-    padding: 0 16px;
-    margin-left: 8px;
-    background-color: #202d45;
-    border: 3px solid #35496b;
-    color: #ffffff;
-    font-size: 17px;
-    font-weight: bold;
-    vertical-align: middle;
-}
-#mov-viewport {
-    width: 780px;
-    height: 490px;
-    overflow: hidden;
-    position: relative;
-}
-.mov-item {
-    height: 66px;
-    margin: 8px 10px;
-    padding: 6px 10px;
-    background-color: #172030;
-    border: 3px solid #233047;
-    overflow: hidden;
-}
-.mov-poster {
-    float: left;
-    width: 48px;
-    height: 64px;
-    background-color: #233047;
-    margin-right: 12px;
-    text-align: center;
-    line-height: 64px;
-    font-size: 12px;
-    color: #f5c518;
-    font-weight: bold;
-}
-.mov-poster img {
-    width: 48px;
-    height: 64px;
-}
-.mov-title {
-    font-size: 19px;
-    font-weight: bold;
-    color: #ffffff;
-    white-space: nowrap;
-    overflow: hidden;
-    margin-bottom: 4px;
-}
-.mov-desc {
-    font-size: 14px;
-    color: #96a8c4;
-    white-space: nowrap;
-    overflow: hidden;
-}
-.vkb-title {
-    font-size: 16px;
-    font-weight: bold;
-    color: #f5c518;
-    margin-bottom: 10px;
-}
-.vkb-row {
-    margin-bottom: 6px;
-    white-space: nowrap;
-}
-.vkb-key {
-    display: inline-block;
-    min-width: 28px;
-    height: 34px;
-    line-height: 34px;
-    padding: 0 4px;
-    margin-right: 3px;
-    text-align: center;
-    background-color: #1e293d;
-    border: 2px solid #314363;
-    color: #ffffff;
-    font-size: 16px;
-    font-weight: bold;
-}
-.vkb-wide {
-    padding: 0 10px;
-    background-color: #263652;
-}
-#mov-preview {
-    margin-top: 14px;
-    padding: 10px;
-    background-color: #161e2e;
-    border: 1px solid #283752;
-    font-size: 14px;
-    color: #c5d2e6;
-    line-height: 1.4;
-    height: 185px;
-    overflow: hidden;
-}
-#footer {
-    width: 1232px;
-    height: 44px;
-    line-height: 44px;
-    padding: 0 24px;
-    background-color: #131a26;
-    border-top: 2px solid #233047;
-    font-size: 15px;
-    color: #9cb0cc;
-}
-.k {
-    display: inline-block;
-    padding: 1px 8px;
-    margin-right: 4px;
-    background-color: #24324a;
-    border: 1px solid #445e87;
-    color: #ffffff;
-    font-weight: bold;
-    font-size: 13px;
-}
-.focused {
-    border-color: #f5c518 !important;
-    background-color: #1f3354 !important;
-}
-#player-screen {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 1280px;
-    height: 720px;
-    background-color: #000000;
-    z-index: 100;
-    display: none;
-}
-#player-holder {
-    width: 1280px;
-    height: 720px;
-}
-#osd {
-    position: absolute;
-    left: 40px;
-    bottom: 36px;
-    width: 1160px;
-    padding: 14px 20px;
-    background-color: #101622;
-    border: 3px solid #f5c518;
-    z-index: 110;
-    display: none;
-}
-#osd-title {
-    font-size: 24px;
-    font-weight: bold;
-    color: #f5c518;
-    margin-bottom: 6px;
-}
-#osd-state {
-    font-size: 17px;
-    color: #e6ecf5;
-}
+<meta charset="UTF-8">
+<title>LGTV Cinema</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0b0e14; color: #f1f5f9; font-family: Arial, sans-serif; overflow: hidden; }
+  #topbar { height: 64px; background: #131924; padding: 10px 24px; border-bottom: 2px solid #1e293b; }
+  .tab { display: inline-block; padding: 10px 22px; margin-right: 12px; background: #1e293b; color: #cbd5e1; border-radius: 6px; font-size: 20px; font-weight: bold; cursor: pointer; border: 3px solid transparent; }
+  .tab.active { background: #2563eb; color: #fff; }
+  .focus { border-color: #facc15 !important; transform: scale(1.04); }
+  #status { float: right; line-height: 44px; color: #94a3b8; font-size: 16px; }
+  #searchBar { display: none; padding: 12px 24px; background: #0f141e; border-bottom: 1px solid #1e293b; }
+  #searchInput { width: 520px; padding: 10px 14px; font-size: 20px; background: #1e293b; color: #fff; border: 3px solid #334155; border-radius: 6px; }
+  .kbd-btn { display: inline-block; padding: 8px 13px; margin: 4px 3px; background: #1e293b; color: #fff; font-size: 18px; border-radius: 4px; border: 2px solid transparent; cursor: pointer; }
+  #grid { height: 630px; overflow-y: auto; padding: 18px 24px; }
+  .card { display: inline-block; vertical-align: top; width: 185px; margin: 0 14px 18px 0; background: #161d2b; border-radius: 8px; overflow: hidden; border: 3px solid transparent; cursor: pointer; }
+  .card img { width: 185px; height: 255px; object-fit: cover; background: #1e293b; display: block; }
+  .card.tv-card img { height: 110px; object-fit: contain; padding: 10px; }
+  .card-title { padding: 8px 10px 4px; font-size: 16px; font-weight: bold; height: 46px; overflow: hidden; }
+  .card-sub { padding: 0 10px 8px; font-size: 13px; color: #94a3b8; height: 24px; overflow: hidden; }
+  #modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(5,8,15,0.95); padding: 36px 56px; z-index: 50; overflow-y: auto; }
+  #modalTitle { font-size: 30px; font-weight: bold; margin-bottom: 10px; color: #fff; }
+  #modalDesc { font-size: 17px; color: #cbd5e1; max-width: 920px; max-height: 160px; overflow: auto; margin-bottom: 18px; line-height: 1.4; }
+  #seriesControls { display: none; margin-bottom: 16px; }
+  .ep-btn { display: inline-block; padding: 8px 16px; margin: 0 8px 8px 0; background: #1e293b; color: #fff; font-size: 18px; border-radius: 6px; border: 3px solid transparent; cursor: pointer; }
+  .stream-btn { display: block; width: 540px; padding: 13px 20px; margin-bottom: 10px; background: #1e293b; color: #fff; font-size: 20px; border-radius: 6px; border: 3px solid transparent; text-align: left; cursor: pointer; }
+  #playerWrap { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #000; z-index: 100; }
+  video { width: 100%; height: 100%; }
+  #playerHud { position: fixed; top: 20px; left: 30px; background: rgba(0,0,0,0.75); padding: 10px 18px; border-radius: 6px; font-size: 20px; color: #facc15; z-index: 101; }
 </style>
 </head>
 <body>
-<div id="app">
-    <div id="topbar">
-        <div id="brand">LG TV</div>
-        <div id="tab-0" class="tab tab-active">1. ТВ-каналы HD (<span id="cnt-tv">0</span>)</div>
-        <div id="tab-1" class="tab">2. Кино и Поиск (<span id="cnt-mov">0</span>)</div>
-        <div id="status">Подключение к серверу...</div>
-    </div>
-
-    <div id="panel-0" class="panel panel-vis">
-        <div id="tv-grid"></div>
-    </div>
-
-    <div id="panel-1" class="panel">
-        <div class="mov-left">
-            <div class="search-row">
-                <div id="search-box" class="search-box">Нажмите ОК для ввода названия...</div>
-                <div id="btn-search" class="btn-sm">Найти</div>
-                <div id="btn-reset" class="btn-sm">Топ</div>
-            </div>
-            <div id="mov-viewport">
-                <div id="mov-list"></div>
-            </div>
-        </div>
-        <div class="mov-right">
-            <div class="vkb-title">Клавиатура (стрелки + ОК):</div>
-            <div id="vkb-rows"></div>
-            <div id="mov-preview">Выберите фильм слева и нажмите ОК — сервер сам найдёт поток.</div>
-        </div>
-    </div>
-
-    <div id="footer">
-        <span class="k">СТРЕЛКИ</span> Выбор &nbsp;&nbsp;
-        <span class="k">ОК</span> Смотреть &nbsp;&nbsp;
-        <span class="k">CH+ / CH-</span> Каналы &nbsp;&nbsp;
-        <span class="k">BACK</span> Стоп / Наверх
-    </div>
-
-    <div id="player-screen">
-        <div id="player-holder"></div>
-        <div id="osd">
-            <div id="osd-title">Воспроизведение</div>
-            <div id="osd-state">Подключение...</div>
-        </div>
-    </div>
+<div id="topbar">
+  <span class="tab active focus" data-tab="films">Фильмы</span>
+  <span class="tab" data-tab="series">Сериалы</span>
+  <span class="tab" data-tab="tv">ТВ-каналы</span>
+  <span class="tab" data-tab="search">Поиск</span>
+  <span id="status">Готово</span>
 </div>
 
-<script type="text/javascript">
-(function () {
-    var WORKER_URL = "http://lgtv.tagirahmadiev7.workers.dev";
-    var COLS = 5;
+<div id="searchBar">
+  <input id="searchInput" type="text" placeholder="Введите название фильма..." />
+  <span class="kbd-btn" data-act="doSearch" style="background:#2563eb;">Найти</span>
+  <span class="kbd-btn" data-act="bksp">← Стереть</span>
+  <span class="kbd-btn" data-act="clear">Очистить</span>
+  <div id="kbd" style="margin-top:8px;"></div>
+</div>
 
-    var state = {
-        tab: 0,
-        zone: "tv_grid",
-        tvIdx: 0,
-        movBarIdx: 0,
-        movIdx: 0,
-        vkbLang: "RU",
-        vkbRow: 1,
-        vkbCol: 0,
-        query: "",
-        tv: [],
-        movies: [],
-        inPlayer: false
-    };
+<div id="grid"></div>
 
-    var osdTimer = null;
-    var pollTimer = null;
+<div id="modal">
+  <div id="modalTitle">Загрузка...</div>
+  <div id="modalDesc"></div>
+  <div id="seriesControls">
+    <span class="ep-btn" data-act="prevSeason">◀ Сезон</span>
+    <span id="seasonLabel" style="font-size:20px;font-weight:bold;margin:0 10px;">Сезон 1</span>
+    <span class="ep-btn" data-act="nextSeason">Сезон ▶</span>
+    <span style="margin-left:20px;"></span>
+    <span class="ep-btn" data-act="prevEp">◀ Серия</span>
+    <span id="epLabel" style="font-size:20px;font-weight:bold;margin:0 10px;">Серия 1</span>
+    <span class="ep-btn" data-act="nextEp">Серия ▶</span>
+  </div>
+  <div id="streamList"></div>
+  <button class="stream-btn" data-act="closeModal" style="background:#334155;margin-top:16px;">← Назад (Return)</button>
+</div>
 
-    var keyboards = {
-        RU: [
-            ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
-            ["Й", "Ц", "У", "К", "Е", "Н", "Г", "Ш", "Щ", "З", "Х"],
-            ["Ф", "Ы", "В", "А", "П", "Р", "О", "Л", "Д", "Ж", "Э"],
-            ["Я", "Ч", "С", "М", "И", "Т", "Ь", "Б", "Ю"],
-            ["RU/EN", "ПРОБЕЛ", "СТЕРЕТЬ", "НАЙТИ"]
-        ],
-        EN: [
-            ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
-            ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-            ["A", "S", "D", "F", "G", "H", "J", "K", "L"],
-            ["Z", "X", "C", "V", "B", "N", "M"],
-            ["RU/EN", "ПРОБЕЛ", "СТЕРЕТЬ", "НАЙТИ"]
-        ]
-    };
+<div id="playerWrap">
+  <div id="playerHud">Воспроизведение... (Назад — выход)</div>
+  <video id="vid" controls autoplay></video>
+</div>
 
-    function byId(id) { return document.getElementById(id); }
-    function trimStr(s) { return s ? s.replace(/^\s+|\s+$/g, "") : ""; }
-    function esc(s) {
-        if (!s) { return ""; }
-        return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+<script>
+var ORIGIN = window.location.origin;
+var currentTab = "films";
+var currentPage = 1;
+var itemsCache = [];
+var focusables = [];
+var focusIdx = 0;
+var activeItem = null;
+var curSeason = 1;
+var curEp = 1;
+var hlsInstance = null;
+
+function setStatus(t) { document.getElementById("status").innerText = t; }
+
+function xhrGet(url, cb) {
+  var x = new XMLHttpRequest();
+  x.open("GET", url, true);
+  x.onreadystatechange = function() {
+    if (x.readyState === 4) {
+      if (x.status === 200) {
+        try { cb(null, JSON.parse(x.responseText)); } catch (e) { cb(e); }
+      } else { cb(new Error("HTTP " + x.status)); }
     }
-    function addClass(el, cls) {
-        if (el && (" " + el.className + " ").indexOf(" " + cls + " ") === -1) {
-            el.className = trimStr(el.className + " " + cls);
-        }
+  };
+  x.send();
+}
+
+function buildKeyboard() {
+  var chars = "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЫЭЮЯ0123456789 ";
+  var html = "";
+  for (var i = 0; i < chars.length; i++) {
+    var ch = chars[i] === " " ? "ПРОБЕЛ" : chars[i];
+    html += '<span class="kbd-btn" data-ch="' + chars[i] + '">' + ch + '</span>';
+  }
+  document.getElementById("kbd").innerHTML = html;
+}
+
+function refreshFocus(resetToGrid) {
+  var prev = focusables[focusIdx];
+  if (prev) prev.className = prev.className.replace(" focus", "");
+  var list = [];
+  if (document.getElementById("playerWrap").style.display === "block") {
+    focusables = [];
+    return;
+  }
+  if (document.getElementById("modal").style.display === "block") {
+    var mbtns = document.getElementById("modal").querySelectorAll(".ep-btn, .stream-btn");
+    for (var i = 0; i < mbtns.length; i++) {
+      if (mbtns[i].offsetParent !== null) list.push(mbtns[i]);
     }
-    function removeClass(el, cls) {
-        if (!el || !el.className) { return; }
-        var p = el.className.split(" "), out = [];
-        for (var i = 0; i < p.length; i++) {
-            if (p[i] && p[i] !== cls) { out.push(p[i]); }
-        }
-        el.className = out.join(" ");
+  } else {
+    var tabs = document.querySelectorAll(".tab");
+    for (var i = 0; i < tabs.length; i++) list.push(tabs[i]);
+    if (currentTab === "search") {
+      var kbtns = document.getElementById("searchBar").querySelectorAll(".kbd-btn");
+      for (var i = 0; i < kbtns.length; i++) list.push(kbtns[i]);
     }
-
-    function proxyUrl(rawUrl) {
-        if (!rawUrl) { return ""; }
-        if (rawUrl.indexOf(WORKER_URL) === 0) { return rawUrl; }
-        return WORKER_URL + "/proxy?url=" + encodeURIComponent(rawUrl);
+    var cards = document.getElementById("grid").querySelectorAll(".card");
+    for (var i = 0; i < cards.length; i++) list.push(cards[i]);
+  }
+  focusables = list;
+  if (resetToGrid) {
+    for (var j = 0; j < focusables.length; j++) {
+      if (focusables[j].className.indexOf("card") !== -1) { focusIdx = j; break; }
     }
+  }
+  if (focusIdx >= focusables.length) focusIdx = 0;
+  if (focusables[focusIdx]) {
+    focusables[focusIdx].className += " focus";
+    if (focusables[focusIdx].scrollIntoView) focusables[focusIdx].scrollIntoView(false);
+  }
+}
 
-    function getLogoStyle(name) {
-        var n = name.toLowerCase();
-        if (n.indexOf("первый") !== -1) { return { bg: "#0055a5", fg: "#ffffff", txt: "1" }; }
-        if (n.indexOf("матч") !== -1) { return { bg: "#c8102e", fg: "#ffffff", txt: "МАТЧ!" }; }
-        if (n.indexOf("нтв") !== -1) { return { bg: "#008f45", fg: "#ffffff", txt: "НТВ" }; }
-        if (n.indexOf("пятый") !== -1) { return { bg: "#b71c1c", fg: "#ffffff", txt: "5" }; }
-        if (n.indexOf("россия") !== -1) { return { bg: "#0d47a1", fg: "#ffffff", txt: "РОССИЯ" }; }
-        if (n.indexOf("рен") !== -1) { return { bg: "#e65100", fg: "#ffffff", txt: "РЕН ТВ" }; }
-        if (n.indexOf("стс") !== -1) { return { bg: "#f5c518", fg: "#111111", txt: "СТС" }; }
-        if (n.indexOf("тнт") !== -1) { return { bg: "#d32f2f", fg: "#ffeb3b", txt: "ТНТ" }; }
-        if (n.indexOf("пятница") !== -1) { return { bg: "#d81b60", fg: "#ffffff", txt: "ПЯТНИЦА!" }; }
-        if (n.indexOf("звезда") !== -1) { return { bg: "#9e1b1b", fg: "#f5c518", txt: "ЗВЕЗДА" }; }
-        var shortTxt = name.length > 8 ? name.substring(0, 7) : name;
-        return { bg: "#26344d", fg: "#dce6f5", txt: shortTxt.toUpperCase() };
+function renderCards(items, isTv) {
+  itemsCache = items || [];
+  var grid = document.getElementById("grid");
+  if (!itemsCache.length) {
+    grid.innerHTML = '<div style="font-size:22px;padding:30px;color:#94a3b8;">Ничего не найдено</div>';
+    refreshFocus(false);
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < itemsCache.length; i++) {
+    var it = itemsCache[i];
+    html += '<div class="card' + (isTv ? ' tv-card' : '') + '" data-idx="' + i + '">';
+    html += '<img src="' + (it.poster || '') + '" onerror="this.style.visibility=\\'hidden\\'">';
+    html += '<div class="card-title">' + it.title + '</div>';
+    html += '<div class="card-sub">' + (isTv ? (it.group || 'ТВ') : (it.genres || it.year || '')) + '</div>';
+    html += '</div>';
+  }
+  if (!isTv && currentTab !== "search") {
+    html += '<div class="card" data-act="nextPage" style="height:325px;text-align:center;padding-top:130px;background:#1e293b;"><div style="font-size:22px;font-weight:bold;">Дальше →</div><div style="color:#94a3b8;margin-top:8px;">Стр. ' + (currentPage + 1) + '</div></div>';
+  }
+  grid.innerHTML = html;
+  grid.scrollTop = 0;
+  refreshFocus(true);
+}
+
+function loadTab(tab, page) {
+  currentTab = tab;
+  currentPage = page || 1;
+  var tabs = document.querySelectorAll(".tab");
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].className = "tab" + (tabs[i].getAttribute("data-tab") === tab ? " active" : "");
+  }
+  document.getElementById("searchBar").style.display = tab === "search" ? "block" : "none";
+  document.getElementById("grid").style.height = tab === "search" ? "460px" : "630px";
+
+  if (tab === "search") {
+    document.getElementById("grid").innerHTML = "";
+    refreshFocus(false);
+    return;
+  }
+  setStatus("Загрузка...");
+  var url = tab === "tv" ? (ORIGIN + "/tv") : (ORIGIN + "/catalog?type=" + tab + "&page=" + currentPage);
+  xhrGet(url, function(err, data) {
+    if (err) { setStatus("Ошибка сети"); return; }
+    setStatus("Готово");
+    renderCards(tab === "tv" ? data.channels : data.items, tab === "tv");
+  });
+}
+
+function fetchStreamsForModal() {
+  if (!activeItem) return;
+  document.getElementById("seasonLabel").innerText = "Сезон " + curSeason;
+  document.getElementById("epLabel").innerText = "Серия " + curEp;
+  document.getElementById("streamList").innerHTML = '<div style="color:#94a3b8;font-size:18px;">Загружаем потоки...</div>';
+  var q = ORIGIN + "/resolve?rezkaUrl=" + encodeURIComponent(activeItem.rezkaUrl) + "&title=" + encodeURIComponent(activeItem.title) + "&s=" + curSeason + "&e=" + curEp;
+  xhrGet(q, function(err, data) {
+    if (err || !data) {
+      document.getElementById("modalDesc").innerText = "Ошибка загрузки потоков.";
+      return;
     }
-
-    function xhrGet(url, onOk, onErr) {
-        var xhr = new XMLHttpRequest();
-        try { xhr.open("GET", url, true); } catch (e) { if (onErr) { onErr(); } return; }
-        xhr.onreadystatechange = function () {
-            if (xhr.readyState === 4) {
-                if ((xhr.status >= 200 && xhr.status < 300) || (xhr.status === 0 && xhr.responseText)) {
-                    onOk(xhr.responseText);
-                } else if (onErr) { onErr(); }
-            }
-        };
-        try { xhr.send(null); } catch (e2) { if (onErr) { onErr(); } }
+    if (data.desc) document.getElementById("modalDesc").innerText = data.desc;
+    document.getElementById("seriesControls").style.display = data.isSeries ? "block" : "none";
+    var streams = data.streams || [];
+    if (!streams.length) {
+      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">Потоки не найдены</div>';
+    } else {
+      var h = "";
+      for (var i = 0; i < streams.length; i++) {
+        h += '<button class="stream-btn" data-url="' + streams[i].url + '" data-hls="' + (streams[i].isHls ? '1' : '0') + '" data-name="' + activeItem.title + ' (' + streams[i].quality + ')">▶ ' + streams[i].name + '</button>';
+      }
+      document.getElementById("streamList").innerHTML = h;
     }
+    focusIdx = 0;
+    refreshFocus(false);
+  });
+}
 
-    function parseM3U(text) {
-        var lines = text.split(/\r?\n/), res = [], meta = null;
-        for (var i = 0; i < lines.length; i++) {
-            var line = trimStr(lines[i]);
-            if (!line) { continue; }
-            if (line.indexOf("#EXTINF:") === 0) {
-                var c = line.lastIndexOf(",");
-                var name = (c !== -1) ? trimStr(line.substring(c + 1)) : "Канал";
-                var gm = line.match(/group-title="([^"]*)"/i);
-                meta = { name: name, group: (gm && gm[1]) ? gm[1] : "Эфир" };
-            } else if (line.charAt(0) !== "#") {
-                if (line.indexOf(".mpd") === -1) {
-                    res.push({
-                        name: meta ? meta.name : ("Канал " + (res.length + 1)),
-                        group: meta ? meta.group : "Локальный",
-                        isHd: meta && meta.name.toUpperCase().indexOf("HD") !== -1,
-                        url: proxyUrl(line)
-                    });
-                }
-                meta = null;
-            }
-        }
-        return res;
+function openItem(it) {
+  if (it.type === "tv" && it.url) {
+    playVideo(it.title, it.url, true);
+    return;
+  }
+  activeItem = it;
+  curSeason = 1;
+  curEp = 1;
+  var modal = document.getElementById("modal");
+  modal.style.display = "block";
+  document.getElementById("modalTitle").innerText = it.title;
+  document.getElementById("modalDesc").innerText = "Получаем данные с HDRezka...";
+  document.getElementById("seriesControls").style.display = "none";
+  fetchStreamsForModal();
+}
+
+function playVideo(title, url, forceHls) {
+  var wrap = document.getElementById("playerWrap");
+  var vid = document.getElementById("vid");
+  document.getElementById("playerHud").innerText = title + " (Назад — выход)";
+  wrap.style.display = "block";
+
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+
+  if (forceHls && window.Hls && Hls.isSupported()) {
+    hlsInstance = new Hls();
+    hlsInstance.loadSource(url);
+    hlsInstance.attachMedia(vid);
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() { vid.play(); });
+  } else {
+    vid.src = url;
+    vid.play();
+  }
+}
+
+function stopVideo() {
+  var wrap = document.getElementById("playerWrap");
+  var vid = document.getElementById("vid");
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+  vid.pause();
+  vid.src = "";
+  wrap.style.display = "none";
+  refreshFocus(false);
+}
+
+function activateElement(el) {
+  if (!el) return;
+  var tab = el.getAttribute("data-tab");
+  if (tab) { loadTab(tab, 1); return; }
+  var act = el.getAttribute("data-act");
+  var inp = document.getElementById("searchInput");
+  if (act === "doSearch") {
+    var q = inp.value;
+    if (!q) return;
+    setStatus("Поиск...");
+    xhrGet(ORIGIN + "/search?q=" + encodeURIComponent(q), function(err, data) {
+      setStatus("Готово");
+      renderCards(data ? data.items : [], false);
+    });
+    return;
+  }
+  if (act === "bksp") { inp.value = inp.value.slice(0, -1); return; }
+  if (act === "clear") { inp.value = ""; return; }
+  if (act === "nextPage") { loadTab(currentTab, currentPage + 1); return; }
+  if (act === "closeModal") { document.getElementById("modal").style.display = "none"; refreshFocus(false); return; }
+  if (act === "prevSeason") { if (curSeason > 1) { curSeason--; curEp = 1; fetchStreamsForModal(); } return; }
+  if (act === "nextSeason") { curSeason++; curEp = 1; fetchStreamsForModal(); return; }
+  if (act === "prevEp") { if (curEp > 1) { curEp--; fetchStreamsForModal(); } return; }
+  if (act === "nextEp") { curEp++; fetchStreamsForModal(); return; }
+  var ch = el.getAttribute("data-ch");
+  if (ch) { inp.value += ch; return; }
+  var sUrl = el.getAttribute("data-url");
+  if (sUrl) { playVideo(el.getAttribute("data-name"), sUrl, el.getAttribute("data-hls") === "1"); return; }
+  var idx = el.getAttribute("data-idx");
+  if (idx !== null) { openItem(itemsCache[parseInt(idx, 10)]); }
+}
+
+document.addEventListener("keydown", function(e) {
+  var code = e.keyCode;
+  if (document.getElementById("playerWrap").style.display === "block") {
+    if (code === 461 || code === 27 || code === 8) { e.preventDefault(); stopVideo(); }
+    return;
+  }
+  if (code === 461 || code === 27) {
+    if (document.getElementById("modal").style.display === "block") {
+      e.preventDefault();
+      document.getElementById("modal").style.display = "none";
+      refreshFocus(false);
     }
+    return;
+  }
+  if (!focusables.length) return;
+  var prev = focusables[focusIdx];
+  if (prev) prev.className = prev.className.replace(" focus", "");
 
-    function renderTvGrid() {
-        var g = byId("tv-grid");
-        var list = state.tv;
-        byId("cnt-tv").innerHTML = String(list.length);
-        if (list.length === 0) {
-            g.innerHTML = '<div style="padding:30px;color:#9cb0cc;">Загрузка списка каналов с сервера...</div>';
-            return;
-        }
-        var max = list.length > 120 ? 120 : list.length;
-        var html = "";
-        for (var i = 0; i < max; i++) {
-            var item = list[i];
-            var st = getLogoStyle(item.name);
-            var badge = item.isHd ? '<div class="card-badge">HD</div>' : '';
-            var fs = st.txt.length > 6 ? "20px" : (st.txt.length > 4 ? "26px" : "34px");
-            var mr = ((i + 1) % COLS === 0) ? "0" : "20px";
-            var logoContent = item.logo
-                ? '<img src="' + esc(item.logo) + '" alt="" />'
-                : esc(st.txt);
+  if (code === 39) focusIdx = Math.min(focusables.length - 1, focusIdx + 1);
+  else if (code === 37) focusIdx = Math.max(0, focusIdx - 1);
+  else if (code === 40) focusIdx = Math.min(focusables.length - 1, focusIdx + 5);
+  else if (code === 38) focusIdx = Math.max(0, focusIdx - 5);
+  else if (code === 13) { e.preventDefault(); activateElement(focusables[focusIdx]); return; }
 
-            html += '<div id="tv-card-' + i + '" class="card" style="margin-right:' + mr + ';">' +
-                '<div class="card-logo" style="background-color:' + st.bg + ';color:' + st.fg + ';font-size:' + fs + ';">' + logoContent + '</div>' +
-                '<div class="card-num">' + (i + 1) + '</div>' + badge +
-                '<div class="card-name">' + esc(item.name) + '</div>' +
-                '<div class="card-group">' + esc(item.group) + '</div>' +
-                '</div>';
-        }
-        g.innerHTML = html;
+  if (focusables[focusIdx]) {
+    focusables[focusIdx].className += " focus";
+    if (focusables[focusIdx].scrollIntoView) focusables[focusIdx].scrollIntoView(false);
+  }
+});
+
+document.addEventListener("click", function(e) {
+  var t = e.target;
+  while (t && t !== document.body) {
+    if (t.getAttribute && (t.getAttribute("data-tab") || t.getAttribute("data-act") || t.getAttribute("data-ch") || t.getAttribute("data-url") || t.getAttribute("data-idx") !== null)) {
+      activateElement(t);
+      return;
     }
+    t = t.parentNode;
+  }
+});
 
-    function renderMoviesList() {
-        var box = byId("mov-list");
-        var list = state.movies;
-        byId("cnt-mov").innerHTML = String(list.length);
-        if (list.length === 0) {
-            box.innerHTML = '<div style="padding:20px;color:#9cb0cc;">Ничего не найдено</div>';
-            return;
-        }
-        var html = "";
-        for (var i = 0; i < list.length; i++) {
-            var m = list[i];
-            var pHtml = m.poster ? '<img src="' + esc(m.poster) + '" alt="" />' : esc(m.year || "HD");
-            var rat = m.rating ? (" ★ " + m.rating) : "";
-            html += '<div id="mov-item-' + i + '" class="mov-item">' +
-                '<div class="mov-poster">' + pHtml + '</div>' +
-                '<div class="mov-title">' + (i + 1) + '. ' + esc(m.title) + ' (' + esc(m.year || "") + rat + ')</div>' +
-                '<div class="mov-desc">' + esc(m.desc || "") + '</div>' +
-                '</div>';
-        }
-        box.innerHTML = html;
-        updateMoviePreview();
-    }
-
-    function updateMoviePreview() {
-        var m = state.movies[state.movIdx];
-        if (!m) { return; }
-        byId("mov-preview").innerHTML = "<b>" + esc(m.title) + "</b><br><br>" + esc(m.desc || "");
-    }
-
-    function renderKeyboard() {
-        var rows = keyboards[state.vkbLang];
-        var html = "";
-        for (var r = 0; r < rows.length; r++) {
-            html += '<div class="vkb-row">';
-            for (var c = 0; c < rows[r].length; c++) {
-                var lbl = rows[r][c];
-                var wide = lbl.length > 1 ? " vkb-wide" : "";
-                var foc = (state.zone === "vkb" && state.vkbRow === r && state.vkbCol === c) ? " focused" : "";
-                html += '<span class="vkb-key' + wide + foc + '">' + esc(lbl) + '</span>';
-            }
-            html += '</div>';
-        }
-        byId("vkb-rows").innerHTML = html;
-        byId("search-box").innerHTML = state.query
-            ? (esc(state.query) + "_")
-            : '<span style="color:#7d95b8;">Нажмите ОК для ввода названия...</span>';
-    }
-
-    function pressVkb() {
-        var rows = keyboards[state.vkbLang];
-        var key = rows[state.vkbRow][state.vkbCol];
-        if (key === "RU/EN") {
-            state.vkbLang = state.vkbLang === "RU" ? "EN" : "RU";
-            if (state.vkbCol >= keyboards[state.vkbLang][state.vkbRow].length) {
-                state.vkbCol = keyboards[state.vkbLang][state.vkbRow].length - 1;
-            }
-        } else if (key === "ПРОБЕЛ") {
-            state.query += " ";
-        } else if (key === "СТЕРЕТЬ") {
-            if (state.query.length > 0) {
-                state.query = state.query.substring(0, state.query.length - 1);
-            }
-        } else if (key === "НАЙТИ") {
-            loadMoviesFromServer(state.query);
-            return;
-        } else {
-            state.query += key.toLowerCase();
-        }
-        renderKeyboard();
-    }
-
-    function loadMoviesFromServer(qStr) {
-        var q = trimStr(qStr);
-        byId("status").innerHTML = q ? ("Поиск: " + esc(q) + "...") : "Загрузка каталога...";
-        xhrGet(WORKER_URL + "/search?q=" + encodeURIComponent(q), function (resp) {
-            var data = null;
-            try { data = JSON.parse(resp); } catch (e) {}
-            var items = (data && data.items) ? data.items : [];
-            state.movies = items;
-            state.movIdx = 0;
-            if (items.length > 0 && state.tab === 1) {
-                state.zone = "mov_list";
-            }
-            byId("status").innerHTML = "Фильмов: " + items.length;
-            renderMoviesList();
-            updateFocus();
-        }, function () {
-            byId("status").innerHTML = "Ошибка поиска на сервере";
-        });
-    }
-
-    function playMovieItem(item) {
-        if (!item) { return; }
-        byId("status").innerHTML = "Поиск рабочих потоков...";
-        var req = WORKER_URL + "/resolve?title=" + encodeURIComponent(item.title || "");
-        if (item.kpId) { req += "&kpId=" + encodeURIComponent(item.kpId); }
-        if (item.archiveId) { req += "&archiveId=" + encodeURIComponent(item.archiveId); }
-
-        xhrGet(req, function (resp) {
-            var data = null;
-            try { data = JSON.parse(resp); } catch (e) {}
-            var streams = (data && data.streams) ? data.streams : [];
-            if (streams.length === 0) {
-                byId("status").innerHTML = "Поток не найден (защита правообладателя)";
-                byId("mov-preview").innerHTML = "<b>" + esc(item.title) + "</b><br><br>К сожалению, открытых потоков без DRM для этого фильма сейчас нет. Попробуйте другой фильм.";
-                return;
-            }
-            byId("status").innerHTML = "Запуск: " + esc(streams[0].name);
-            startPlayer(streams[0].url, item.title + " [" + streams[0].name + "]");
-        }, function () {
-            byId("status").innerHTML = "Ошибка сервера при получении потока";
-        });
-    }
-
-    function switchTab(t) {
-        state.tab = t;
-        removeClass(byId("tab-0"), "tab-active");
-        removeClass(byId("tab-1"), "tab-active");
-        addClass(byId("tab-" + t), "tab-active");
-
-        removeClass(byId("panel-0"), "panel-vis");
-        removeClass(byId("panel-1"), "panel-vis");
-        addClass(byId("panel-" + t), "panel-vis");
-        updateFocus();
-    }
-
-    function scrollInto(vpId, el) {
-        var vp = byId(vpId);
-        if (!vp || !el) { return; }
-        var top = el.offsetTop;
-        var bot = top + el.offsetHeight + 16;
-        if (top < vp.scrollTop) { vp.scrollTop = top - 12; }
-        else if (bot > vp.scrollTop + vp.clientHeight) { vp.scrollTop = bot - vp.clientHeight; }
-    }
-
-    function updateFocus() {
-        var i;
-        removeClass(byId("tab-0"), "focused");
-        removeClass(byId("tab-1"), "focused");
-        removeClass(byId("search-box"), "focused");
-        removeClass(byId("btn-search"), "focused");
-        removeClass(byId("btn-reset"), "focused");
-        for (i = 0; i < 120; i++) { removeClass(byId("tv-card-" + i), "focused"); }
-        for (i = 0; i < state.movies.length; i++) { removeClass(byId("mov-item-" + i), "focused"); }
-        renderKeyboard();
-
-        if (state.zone === "tabs") {
-            addClass(byId("tab-" + state.tab), "focused");
-            return;
-        }
-        if (state.tab === 0) {
-            var tc = byId("tv-card-" + state.tvIdx);
-            if (tc) {
-                addClass(tc, "focused");
-                scrollInto("panel-0", tc);
-            }
-        } else {
-            if (state.zone === "mov_bar") {
-                var ids = ["search-box", "btn-search", "btn-reset"];
-                addClass(byId(ids[state.movBarIdx]), "focused");
-            } else if (state.zone === "mov_list") {
-                var mi = byId("mov-item-" + state.movIdx);
-                if (mi) {
-                    addClass(mi, "focused");
-                    scrollInto("mov-viewport", mi);
-                    updateMoviePreview();
-                }
-            }
-        }
-    }
-
-    function showOsd(title, text, keepOpen) {
-        byId("osd-title").innerHTML = esc(title);
-        byId("osd-state").innerHTML = esc(text);
-        byId("osd").style.display = "block";
-        if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
-        if (!keepOpen) {
-            osdTimer = setTimeout(function () { byId("osd").style.display = "none"; }, 4000);
-        }
-    }
-
-    function destroyPlayer() {
-        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-        var obj = byId("lg-av");
-        if (obj) { try { if (typeof obj.stop === "function") { obj.stop(); } } catch (e) {} }
-        byId("player-holder").innerHTML = "";
-    }
-
-    function startPlayer(playUrl, title) {
-        state.inPlayer = true;
-        destroyPlayer();
-        byId("player-screen").style.display = "block";
-        showOsd(title, "Подключение через сервер...", true);
-
-        byId("player-holder").innerHTML = '<object id="lg-av" type="application/x-netcast-av" ' +
-            'data="' + esc(playUrl) + '" width="1280" height="720" autoStart="true"></object>';
-
-        setTimeout(function () {
-            var obj = byId("lg-av");
-            if (obj) { try { if (typeof obj.play === "function") { obj.play(1); } } catch (e) {} }
-        }, 250);
-
-        var playedOnce = false;
-        var ticks = 0;
-        pollTimer = setInterval(function () {
-            var obj = byId("lg-av");
-            if (!obj) { return; }
-            ticks++;
-            var ps = obj.playState;
-            if (ps === 1) {
-                if (!playedOnce) {
-                    playedOnce = true;
-                    showOsd(title, "Воспроизведение HD | CH+/CH- — каналы | BACK — выход", false);
-                }
-            } else if (ps === 3 || ps === 4) {
-                showOsd(title, "Буферизация потока...", true);
-            } else if (ps === 6 || (ticks > 15 && !playedOnce)) {
-                showOsd(title, "Источник недоступен. Нажмите CH+/CH- или BACK.", true);
-                clearInterval(pollTimer);
-                pollTimer = null;
-            }
-        }, 1000);
-    }
-
-    function stopPlayer() {
-        if (osdTimer) { clearTimeout(osdTimer); osdTimer = null; }
-        destroyPlayer();
-        state.inPlayer = false;
-        byId("osd").style.display = "none";
-        byId("player-screen").style.display = "none";
-        updateFocus();
-    }
-
-    document.onkeydown = function (e) {
-        var evt = e || window.event;
-        var key = evt.keyCode || evt.which;
-
-        if (state.inPlayer) {
-            if (key === 461 || key === 8 || key === 27) {
-                stopPlayer();
-            } else if (key === 13) {
-                showOsd("Плеер", "CH+/CH- — каналы | BACK — выход", false);
-            } else if ((key === 427 || key === 33) && state.tab === 0 && state.tv.length > 1) {
-                state.tvIdx = (state.tvIdx + 1) % state.tv.length;
-                startPlayer(state.tv[state.tvIdx].url, (state.tvIdx + 1) + ". " + state.tv[state.tvIdx].name);
-            } else if ((key === 428 || key === 34) && state.tab === 0 && state.tv.length > 1) {
-                state.tvIdx = (state.tvIdx - 1 + state.tv.length) % state.tv.length;
-                startPlayer(state.tv[state.tvIdx].url, (state.tvIdx + 1) + ". " + state.tv[state.tvIdx].name);
-            }
-            if (evt.preventDefault) { evt.preventDefault(); }
-            return false;
-        }
-
-        if (state.tab === 1 && state.zone === "vkb") {
-            var rows = keyboards[state.vkbLang];
-            if (key === 37) {
-                if (state.vkbCol > 0) { state.vkbCol--; }
-                else { state.zone = "mov_list"; }
-            } else if (key === 39) {
-                if (state.vkbCol < rows[state.vkbRow].length - 1) { state.vkbCol++; }
-            } else if (key === 38) {
-                if (state.vkbRow > 0) {
-                    state.vkbRow--;
-                    if (state.vkbCol >= rows[state.vkbRow].length) { state.vkbCol = rows[state.vkbRow].length - 1; }
-                } else { state.zone = "mov_bar"; }
-            } else if (key === 40) {
-                if (state.vkbRow < rows.length - 1) {
-                    state.vkbRow++;
-                    if (state.vkbCol >= rows[state.vkbRow].length) { state.vkbCol = rows[state.vkbRow].length - 1; }
-                }
-            } else if (key === 13) { pressVkb(); }
-            else if (key === 461 || key === 8) { state.zone = "mov_list"; }
-            updateFocus();
-            if (evt.preventDefault) { evt.preventDefault(); }
-            return false;
-        }
-
-        if (state.zone === "tabs") {
-            if (key === 37 || key === 39) {
-                switchTab(state.tab === 0 ? 1 : 0);
-            } else if (key === 40 || key === 13) {
-                state.zone = state.tab === 0 ? "tv_grid" : "mov_bar";
-            }
-        } else if (state.tab === 0) {
-            var maxTv = (state.tv.length > 120 ? 120 : state.tv.length) - 1;
-            if (key === 37 && state.tvIdx > 0) { state.tvIdx--; }
-            else if (key === 39 && state.tvIdx < maxTv) { state.tvIdx++; }
-            else if (key === 38) {
-                if (state.tvIdx >= COLS) { state.tvIdx -= COLS; }
-                else { state.zone = "tabs"; }
-            } else if (key === 40) {
-                if (state.tvIdx + COLS <= maxTv) { state.tvIdx += COLS; }
-                else if (maxTv >= 0) { state.tvIdx = maxTv; }
-            } else if (key === 13 && state.tv.length > 0) {
-                startPlayer(state.tv[state.tvIdx].url, (state.tvIdx + 1) + ". " + state.tv[state.tvIdx].name);
-                if (evt.preventDefault) { evt.preventDefault(); }
-                return false;
-            } else if (key === 461 || key === 8) { state.zone = "tabs"; }
-        } else {
-            if (state.zone === "mov_bar") {
-                if (key === 37 && state.movBarIdx > 0) { state.movBarIdx--; }
-                else if (key === 39 && state.movBarIdx < 2) { state.movBarIdx++; }
-                else if (key === 38) { state.zone = "tabs"; }
-                else if (key === 40) { state.zone = "mov_list"; }
-                else if (key === 13) {
-                    if (state.movBarIdx === 0) {
-                        state.zone = "vkb";
-                        state.vkbRow = 1;
-                        state.vkbCol = 0;
-                    } else if (state.movBarIdx === 1) {
-                        loadMoviesFromServer(state.query);
-                    } else {
-                        state.query = "";
-                        loadMoviesFromServer("");
-                    }
-                } else if (key === 461 || key === 8) { state.zone = "tabs"; }
-            } else if (state.zone === "mov_list") {
-                if (key === 38) {
-                    if (state.movIdx > 0) { state.movIdx--; }
-                    else { state.zone = "mov_bar"; }
-                } else if (key === 40 && state.movIdx < state.movies.length - 1) {
-                    state.movIdx++;
-                } else if (key === 39) {
-                    state.zone = "vkb";
-                } else if (key === 13) {
-                    playMovieItem(state.movies[state.movIdx]);
-                } else if (key === 461 || key === 8) { state.zone = "tabs"; }
-            }
-        }
-
-        updateFocus();
-        if (evt.preventDefault) { evt.preventDefault(); }
-        return false;
-    };
-
-    window.onload = function () {
-        // 1. Загружаем живые HD-каналы с сервера + объединяем с локальным playlist.m3u
-        xhrGet(WORKER_URL + "/tv", function (resp) {
-            var data = null;
-            try { data = JSON.parse(resp); } catch (e) {}
-            var srvChannels = (data && data.channels) ? data.channels : [];
-            xhrGet("playlist.m3u", function (txt) {
-                state.tv = srvChannels.concat(parseM3U(txt));
-                renderTvGrid();
-                updateFocus();
-            }, function () {
-                state.tv = srvChannels;
-                renderTvGrid();
-                updateFocus();
-            });
-            byId("status").innerHTML = "Сервер: OK • HD-каналов: " + srvChannels.length;
-        }, function () {
-            byId("status").innerHTML = "Сервер недоступен";
-            xhrGet("playlist.m3u", function (txt) {
-                state.tv = parseM3U(txt);
-                renderTvGrid();
-                updateFocus();
-            });
-        });
-
-        // 2. Загружаем витрину популярных фильмов
-        loadMoviesFromServer("");
-    };
-})();
+buildKeyboard();
+loadTab("films", 1);
 </script>
 </body>
-</html>
+</html>`;
+
+const server = http.createServer(async (req, res) => {
+  const host = req.headers.host || `localhost:${PORT}`;
+  const proto = req.headers["x-forwarded-proto"] || "http";
+  const origin = `${proto}://${host}`;
+  const reqUrl = new URL(req.url, origin);
+  const path = reqUrl.pathname;
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  const sendJson = (obj, code = 200) => {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(obj));
+  };
+
+  if (path === "/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    return res.end(TV_UI_HTML);
+  }
+
+  if (path === "/debug-ajax") {
+    const r = await rezkaRequest("/series/comedy/1191-druzya-1994.html");
+    const init = r.text.match(/initCDNSeriesEvents\([^)]+\)/);
+    const fav = r.text.match(/ctrl_favs[^>]+value="([^"]+)"/);
+    const body = new URLSearchParams({
+      id: "1191", translator_id: "238", season: "1", episode: "1",
+      favs: fav ? fav[1] : "", action: "get_stream"
+    });
+    const a = await rezkaRequest(`/ajax/get_cdn_series/?t=${Date.now()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" },
+      body: body.toString()
+    });
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end(`Mirror: ${r.base}\ninit: ${init ? init[0] : "none"}\nfav: ${fav ? fav[1] : "none"}\nAJAX: ${a.text}`);
+  }
+
+  if (path === "/tv") {
+    const sources = [
+      "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_russia.m3u8",
+      "https://iptv-org.github.io/iptv/countries/ru.m3u"
+    ];
+    const fetched = await Promise.allSettled(
+      sources.map((u) => fetch(u, { headers: { "User-Agent": UA } }).then((r) => (r.ok ? r.text() : "")))
+    );
+    const channels = [];
+    const seen = new Set();
+    for (const item of fetched) {
+      if (item.status !== "fulfilled" || !item.value) continue;
+      let meta = null;
+      for (const raw of item.value.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        if (line.startsWith("#EXTINF:")) {
+          const comma = line.lastIndexOf(",");
+          const name = comma !== -1 ? line.substring(comma + 1).trim() : "Канал";
+          const grp = line.match(/group-title="([^"]*)"/i);
+          const logo = line.match(/tvg-logo="([^"]*)"/i);
+          meta = { name, group: grp ? grp[1] : "Эфир", logo: logo ? logo[1] : "" };
+        } else if (!line.startsWith("#")) {
+          if (meta && !line.includes(".mpd")) {
+            const key = meta.name.toLowerCase();
+            if (!seen.has(key)) {
+              seen.add(key);
+              channels.push({
+                id: "tv_" + channels.length,
+                type: "tv",
+                title: meta.name,
+                group: meta.group,
+                isHd: /hd|1080|720|fhd/i.test(meta.name),
+                poster: meta.logo ? `${origin}/proxy?img=1&url=${encodeURIComponent(meta.logo)}` : "",
+                url: `${origin}/proxy?url=${encodeURIComponent(line)}`
+              });
+            }
+          }
+          meta = null;
+        }
+      }
+    }
+    channels.sort((a, b) => (b.isHd ? 1 : 0) - (a.isHd ? 1 : 0));
+    return sendJson({ channels: channels.slice(0, 160) });
+  }
+
+  if (path === "/catalog") {
+    const cat = reqUrl.searchParams.get("type") === "series" ? "series" : "films";
+    const page = parseInt(reqUrl.searchParams.get("page") || "1", 10) || 1;
+    const r = await rezkaRequest(`/${cat}/${page > 1 ? `page/${page}/` : ""}?filter=popular`);
+    return sendJson({ items: parseCards(r.text, origin, cat) });
+  }
+
+  if (path === "/search") {
+    const q = (reqUrl.searchParams.get("q") || "").trim();
+    if (!q) return sendJson({ items: [] });
+    const r = await rezkaRequest(`/search/?do=search&subaction=search&q=${encodeURIComponent(q)}`);
+    return sendJson({ items: parseCards(r.text, origin, "movie") });
+  }
+
+  if (path === "/resolve") {
+    const title = reqUrl.searchParams.get("title") || "";
+    const season = reqUrl.searchParams.get("s") || "1";
+    const episode = reqUrl.searchParams.get("e") || "1";
+    let pageUrl = reqUrl.searchParams.get("rezkaUrl") || "";
+
+    if (!pageUrl && title) {
+      const sRes = await rezkaRequest(`/search/?do=search&subaction=search&q=${encodeURIComponent(title)}`);
+      const cards = parseCards(sRes.text, origin, "movie");
+      if (cards[0]) pageUrl = cards[0].rezkaUrl;
+    }
+    if (!pageUrl) return sendJson({ streams: [], desc: "Фильм не найден." });
+
+    const r = await rezkaRequest(pageUrl);
+    if (!r.ok) return sendJson({ streams: [], desc: "Не удалось открыть страницу фильма." });
+
+    const descM = r.text.match(/<div class="b-post__description_text">([\s\S]*?)<\/div>/);
+    const desc = descM ? descM[1].replace(/<[^>]+>/g, "").trim() : "";
+    const favM = r.text.match(/id="ctrl_favs"\s+value="([^"]+)"/);
+    const favs = favM ? favM[1] : "";
+
+    let isSeries = false;
+    let streams = [];
+    const streamM = r.text.match(/"streams"\s*:\s*"([^"]+)"/);
+    if (streamM) streams = parseStreams(decodeRezkaStreams(streamM[1]), origin);
+
+    const initM = r.text.match(/initCDN(Movies|Series)Events\(\s*(\d+)\s*,\s*(\d+)/);
+    if (initM) {
+      isSeries = initM[1] === "Series";
+      const postId = initM[2];
+
+      const trIds = [initM[3]];
+      const trMatches = r.text.matchAll(/data-translator_id="(\d+)"/g);
+      for (const tm of trMatches) {
+        if (!trIds.includes(tm[1])) trIds.push(tm[1]);
+      }
+
+      if (streams.length === 0 || isSeries) {
+        for (const tid of trIds.slice(0, 4)) {
+          const body = new URLSearchParams({
+            id: postId,
+            translator_id: tid,
+            is_camrip: "0",
+            is_ads: "0",
+            is_director: "0",
+            favs: favs,
+            action: isSeries ? "get_stream" : "get_movie"
+          });
+          if (isSeries) {
+            body.set("season", season);
+            body.set("episode", episode);
+          }
+
+          const aRes = await rezkaRequest(`/ajax/get_cdn_series/?t=${Date.now()}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": pageUrl.startsWith("http") ? pageUrl : r.base + pageUrl
+            },
+            body: body.toString()
+          });
+          try {
+            const aData = JSON.parse(aRes.text);
+            if (aData && aData.url) {
+              const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
+              if (parsed.length > 0) {
+                streams = parsed;
+                break;
+              }
+            }
+          } catch (e) {}
+        }
+      }
+    }
+    return sendJson({ streams, desc, isSeries });
+  }
+
+  if (path === "/proxy") {
+    const target = reqUrl.searchParams.get("url");
+    const isImg = reqUrl.searchParams.get("img") === "1";
+    if (!target) { res.writeHead(400); return res.end("Missing url"); }
+
+    try {
+      const targetObj = new URL(target);
+      const fwdHeaders = {
+        "User-Agent": UA,
+        "Referer": targetObj.origin + "/"
+      };
+      if (req.headers.range) fwdHeaders["Range"] = req.headers.range;
+
+      const upstream = await fetch(target, { headers: fwdHeaders, redirect: "follow" });
+      const ct = upstream.headers.get("content-type") || "";
+      const finalUrl = upstream.url || target;
+
+      if (!isImg && (finalUrl.toLowerCase().includes(".m3u8") || ct.toLowerCase().includes("mpegurl"))) {
+        const text = await upstream.text();
+        const baseDir = finalUrl.substring(0, finalUrl.lastIndexOf("/") + 1);
+        const finalOrigin = new URL(finalUrl).origin;
+        const toAbs = (u) => u.startsWith("//") ? "https:" + u : (u.startsWith("http") ? u : (u.startsWith("/") ? finalOrigin + u : baseDir + u));
+
+        const rewritten = text.split(/\r?\n/).map((line) => {
+          const t = line.trim();
+          if (!t) return line;
+          if (t.startsWith("#")) {
+            return t.replace(/URI="([^"]+)"/gi, (_, uri) => `URI="${origin}/proxy?url=${encodeURIComponent(toAbs(uri))}"`);
+          }
+          return `${origin}/proxy?url=${encodeURIComponent(toAbs(t))}`;
+        }).join("\n");
+
+        res.writeHead(upstream.status, {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "no-cache"
+        });
+        return res.end(rewritten);
+      }
+
+      const outHeaders = {};
+      if (ct) outHeaders["Content-Type"] = ct;
+      const cl = upstream.headers.get("content-length");
+      if (cl) outHeaders["Content-Length"] = cl;
+      const cr = upstream.headers.get("content-range");
+      if (cr) outHeaders["Content-Range"] = cr;
+      outHeaders["Accept-Ranges"] = "bytes";
+      if (isImg) outHeaders["Cache-Control"] = "public, max-age=86400";
+
+      res.writeHead(upstream.status, outHeaders);
+      if (upstream.body) {
+        const reader = upstream.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
+      }
+      return res.end();
+    } catch (e) {
+      res.writeHead(502);
+      return res.end("Proxy error");
+    }
+  }
+
+  res.writeHead(404);
+  res.end("Not Found");
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("LG TV Gateway listening on port " + PORT);
+});
