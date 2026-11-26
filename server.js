@@ -493,7 +493,17 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(TV_UI_HTML);
   }
-
+if (path === "/debug-stream") {
+    const s = await rezkaRequest("/films/?filter=popular");
+    const cards = parseCards(s.text, origin, "movie");
+    const first = cards[0];
+    const page = first ? await rezkaRequest(first.rezkaUrl) : { text: "" };
+    const st = page.text.match(/"streams"\s*:\s*"([^"]+)"/);
+    const init = page.text.match(/initCDN(Movies|Series)Events\([^)]+\)/);
+    const decoded = st ? decodeRezkaStreams(st[1]) : "НЕТ streams в HTML";
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end(`Фильм: ${first ? first.title : "-"}\ninitCDN: ${init ? init[0] : "НЕТ"}\nDecoded:\n${decoded}`);
+  }
   if (path === "/tv") {
     const sources = [
       "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_russia.m3u8",
