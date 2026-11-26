@@ -623,6 +623,8 @@ const server = http.createServer(async (req, res) => {
 
     const descM = r.text.match(/<div class="b-post__description_text">([\s\S]*?)<\/div>/);
     const desc = descM ? descM[1].replace(/<[^>]+>/g, "").trim() : "";
+    const favM = r.text.match(/id="ctrl_favs"\s+value="([^"]+)"/);
+    const favs = favM ? favM[1] : "";
 
     let isSeries = false;
     let streams = [];
@@ -632,37 +634,49 @@ const server = http.createServer(async (req, res) => {
     const initM = r.text.match(/initCDN(Movies|Series)Events\(\s*(\d+)\s*,\s*(\d+)/);
     if (initM) {
       isSeries = initM[1] === "Series";
-      if (streams.length === 0 || isSeries) {
-        const body = new URLSearchParams({
-          id: initM[2],
-          translator_id: initM[3],
-          action: isSeries ? "get_stream" : "get_movie"
-        });
-        if (isSeries) {
-          body.set("season", season);
-          body.set("episode", episode);
-        }
+      const postId = initM[2];
 
-        const aRes = await rezkaRequest(`/ajax/get_cdn_series/?t=${Date.now()}`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": pageUrl.startsWith("http") ? pageUrl : r.base + pageUrl
-          },
-          body: body.toString()
-        });
-        try {
-          const aData = JSON.parse(aRes.text);
-          if (aData && aData.url) {
-            const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
-            if (parsed.length > 0) streams = parsed;
+      const trIds = [initM[3]];
+      const trMatches = r.text.matchAll(/data-translator_id="(\d+)"/g);
+      for (const tm of trMatches) {
+        if (!trIds.includes(tm[1])) trIds.push(tm[1]);
+      }
+
+      if (streams.length === 0 || isSeries) {
+        for (const tid of trIds.slice(0, 4)) {
+          const body = new URLSearchParams({
+            id: postId,
+            translator_id: tid,
+            is_camrip: "0",
+            is_ads: "0",
+            is_director: "0",
+            favs: favs,
+            action: isSeries ? "get_stream" : "get_movie"
+          });
+          if (isSeries) {
+            body.set("season", season);
+            body.set("episode", episode);
           }
-          if (streams.length === 0) {
-            return sendJson({ streams: [], desc: "AJAX ответ: " + aRes.text.slice(0, 300), isSeries });
-          }
-        } catch (e) {
-          return sendJson({ streams: [], desc: "AJAX не JSON (" + aRes.base + "): " + aRes.text.slice(0, 300), isSeries });
+
+          const aRes = await rezkaRequest(`/ajax/get_cdn_series/?t=${Date.now()}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": pageUrl.startsWith("http") ? pageUrl : r.base + pageUrl
+            },
+            body: body.toString()
+          });
+          try {
+            const aData = JSON.parse(aRes.text);
+            if (aData && aData.url) {
+              const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
+              if (parsed.length > 0) {
+                streams = parsed;
+                break;
+              }
+            }
+          } catch (e) {}
         }
       }
     }
