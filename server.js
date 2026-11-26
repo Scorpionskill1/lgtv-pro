@@ -5,7 +5,27 @@ const PORT = process.env.PORT || 3000;
 const MIRRORS = ["https://rezka.ag", "https://hdrezka.me", "https://rezka-ua.tv"];
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-const cookieJar = {};
+const cookieStore = {};
+
+function mergeCookies(base, res) {
+  if (!cookieStore[base]) cookieStore[base] = {};
+  const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
+  for (const item of raw) {
+    const pair = item.split(";")[0].trim();
+    const eq = pair.indexOf("=");
+    if (eq > 0) {
+      const k = pair.slice(0, eq).trim();
+      const v = pair.slice(eq + 1).trim();
+      if (v) cookieStore[base][k] = v;
+      else delete cookieStore[base][k];
+    }
+  }
+}
+
+function getCookieHeader(base) {
+  const jar = cookieStore[base] || {};
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ");
+}
 
 function solveAnubis(html) {
   const m = html.match(/<script[^>]*id="anubis_challenge"[^>]*>([\s\S]*?)<\/script>/i);
@@ -37,54 +57,45 @@ function solveAnubis(html) {
   return null;
 }
 
-async function ensureCookie(base) {
-  if (cookieJar[base]) return cookieJar[base];
-  const target = base + "/films/?filter=popular";
-  const res = await fetch(target, {
-    headers: { "User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9", "Referer": base + "/" }
-  });
-  const text = await res.text();
-  if (text.includes("anubis_challenge")) {
-    const initCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
-    const initCookieHeader = initCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
-    const solved = solveAnubis(text);
-    if (solved) {
-      const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(target)}&elapsedTime=${solved.elapsedTime}`;
-      const passRes = await fetch(passUrl, {
-        headers: { "User-Agent": UA, "Referer": target, ...(initCookieHeader ? { Cookie: initCookieHeader } : {}) },
-        redirect: "manual"
-      });
-      const rawCookies = passRes.headers.getSetCookie ? passRes.headers.getSetCookie() : [passRes.headers.get("set-cookie")].filter(Boolean);
-      const authCookie = rawCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
-      if (authCookie) cookieJar[base] = authCookie;
-    }
-  }
-  return cookieJar[base] || "";
-}
-
 async function rezkaRequest(path, opts = {}) {
   for (const base of MIRRORS) {
     const target = path.startsWith("http") ? path : base + path;
     try {
-      let ck = await ensureCookie(base);
-      const makeHeaders = (cookieVal) => ({
-        "User-Agent": UA,
-        "Accept": "*/*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": base,
-        "Referer": base + "/",
-        ...(cookieVal ? { Cookie: cookieVal } : {}),
-        ...(opts.headers || {})
-      });
+      const buildHeaders = () => {
+        const ck = getCookieHeader(base);
+        return {
+          "User-Agent": UA,
+          "Accept": "*/*",
+          "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+          "Origin": base,
+          "Referer": base + "/",
+          ...(ck ? { Cookie: ck } : {}),
+          ...(opts.headers || {})
+        };
+      };
 
-      let res = await fetch(target, { ...opts, headers: makeHeaders(ck), redirect: "follow" });
+      let res = await fetch(target, { ...opts, headers: buildHeaders(), redirect: "follow" });
+      mergeCookies(base, res);
       let text = await res.text();
 
       if (text.includes("anubis_challenge")) {
-        delete cookieJar[base];
-        ck = await ensureCookie(base);
-        res = await fetch(target, { ...opts, headers: makeHeaders(ck), redirect: "follow" });
-        text = await res.text();
+        const solved = solveAnubis(text);
+        if (solved) {
+          const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(target)}&elapsedTime=${solved.elapsedTime}`;
+          const passRes = await fetch(passUrl, {
+            headers: {
+              "User-Agent": UA,
+              "Referer": target,
+              ...(getCookieHeader(base) ? { Cookie: getCookieHeader(base) } : {})
+            },
+            redirect: "manual"
+          });
+          mergeCookies(base, passRes);
+
+          res = await fetch(target, { ...opts, headers: buildHeaders(), redirect: "follow" });
+          mergeCookies(base, res);
+          text = await res.text();
+        }
       }
 
       if (res.ok && !text.includes("anubis_challenge")) {
@@ -545,23 +556,6 @@ const server = http.createServer(async (req, res) => {
     return res.end(TV_UI_HTML);
   }
 
-  if (path === "/debug-ajax") {
-    const r = await rezkaRequest("/series/comedy/1191-druzya-1994.html");
-    const init = r.text.match(/initCDNSeriesEvents\([^)]+\)/);
-    const fav = r.text.match(/ctrl_favs[^>]+value="([^"]+)"/);
-    const body = new URLSearchParams({
-      id: "1191", translator_id: "238", season: "1", episode: "1",
-      favs: fav ? fav[1] : "", action: "get_stream"
-    });
-    const a = await rezkaRequest(`/ajax/get_cdn_series/?t=${Date.now()}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" },
-      body: body.toString()
-    });
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    return res.end(`Mirror: ${r.base}\ninit: ${init ? init[0] : "none"}\nfav: ${fav ? fav[1] : "none"}\nAJAX: ${a.text}`);
-  }
-
   if (path === "/tv") {
     const sources = [
       "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_russia.m3u8",
@@ -640,7 +634,7 @@ const server = http.createServer(async (req, res) => {
 
     const descM = r.text.match(/<div class="b-post__description_text">([\s\S]*?)<\/div>/);
     const desc = descM ? descM[1].replace(/<[^>]+>/g, "").trim() : "";
-    const favM = r.text.match(/id="ctrl_favs"\s+value="([^"]+)"/);
+    const favM = r.text.match(/id="ctrl_favs"[^>]+value="([^"]+)"/i) || r.text.match(/value="([^"]+)"[^>]+id="ctrl_favs"/i);
     const favs = favM ? favM[1] : "";
 
     let isSeries = false;
