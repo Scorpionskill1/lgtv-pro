@@ -37,47 +37,54 @@ function solveAnubis(html) {
   return null;
 }
 
+async function ensureCookie(base) {
+  if (cookieJar[base]) return cookieJar[base];
+  const target = base + "/films/?filter=popular";
+  const res = await fetch(target, {
+    headers: { "User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9", "Referer": base + "/" }
+  });
+  const text = await res.text();
+  if (text.includes("anubis_challenge")) {
+    const initCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
+    const initCookieHeader = initCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
+    const solved = solveAnubis(text);
+    if (solved) {
+      const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(target)}&elapsedTime=${solved.elapsedTime}`;
+      const passRes = await fetch(passUrl, {
+        headers: { "User-Agent": UA, "Referer": target, ...(initCookieHeader ? { Cookie: initCookieHeader } : {}) },
+        redirect: "manual"
+      });
+      const rawCookies = passRes.headers.getSetCookie ? passRes.headers.getSetCookie() : [passRes.headers.get("set-cookie")].filter(Boolean);
+      const authCookie = rawCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
+      if (authCookie) cookieJar[base] = authCookie;
+    }
+  }
+  return cookieJar[base] || "";
+}
+
 async function rezkaRequest(path, opts = {}) {
   for (const base of MIRRORS) {
     const target = path.startsWith("http") ? path : base + path;
-    const headers = {
-      "User-Agent": UA,
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Referer": base + "/",
-      ...(cookieJar[base] ? { Cookie: cookieJar[base] } : {}),
-      ...(opts.headers || {})
-    };
-
     try {
-      let res = await fetch(target, { ...opts, headers, redirect: "follow" });
+      let ck = await ensureCookie(base);
+      const makeHeaders = (cookieVal) => ({
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": base,
+        "Referer": base + "/",
+        ...(cookieVal ? { Cookie: cookieVal } : {}),
+        ...(opts.headers || {})
+      });
+
+      let res = await fetch(target, { ...opts, headers: makeHeaders(ck), redirect: "follow" });
       let text = await res.text();
 
       if (text.includes("anubis_challenge")) {
-        const initCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
-        const initCookieHeader = initCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
-
-        const solved = solveAnubis(text);
-        if (solved) {
-          const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(target)}&elapsedTime=${solved.elapsedTime}`;
-          const passRes = await fetch(passUrl, {
-            headers: {
-              "User-Agent": UA,
-              "Referer": target,
-              ...(initCookieHeader ? { Cookie: initCookieHeader } : {})
-            },
-            redirect: "manual"
-          });
-          const rawCookies = passRes.headers.getSetCookie ? passRes.headers.getSetCookie() : [passRes.headers.get("set-cookie")].filter(Boolean);
-          const authCookie = rawCookies.map((c) => c.split(";")[0]).filter((c) => !c.endsWith("=")).join("; ");
-
-          if (authCookie) {
-            cookieJar[base] = authCookie;
-            headers.Cookie = authCookie;
-            res = await fetch(target, { ...opts, headers, redirect: "follow" });
-            text = await res.text();
-          }
-        }
+        delete cookieJar[base];
+        ck = await ensureCookie(base);
+        res = await fetch(target, { ...opts, headers: makeHeaders(ck), redirect: "follow" });
+        text = await res.text();
       }
 
       if (res.ok && !text.includes("anubis_challenge")) {
@@ -126,6 +133,7 @@ function parseStreams(decoded, origin) {
     if (url) {
       list.push({
         quality: q,
+        isHls: !mp4 && Boolean(hls),
         name: `HDRezka • ${q} (${mp4 ? "MP4" : "HLS"})`,
         url: `${origin}/proxy?url=${encodeURIComponent(url)}`
       });
@@ -168,6 +176,7 @@ const TV_UI_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>LGTV Cinema</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0b0e14; color: #f1f5f9; font-family: Arial, sans-serif; overflow: hidden; }
@@ -185,13 +194,16 @@ const TV_UI_HTML = `<!DOCTYPE html>
   .card.tv-card img { height: 110px; object-fit: contain; padding: 10px; }
   .card-title { padding: 8px 10px 4px; font-size: 16px; font-weight: bold; height: 46px; overflow: hidden; }
   .card-sub { padding: 0 10px 8px; font-size: 13px; color: #94a3b8; height: 24px; overflow: hidden; }
-  #modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(5,8,15,0.94); padding: 40px 60px; z-index: 50; }
-  #modalTitle { font-size: 30px; font-weight: bold; margin-bottom: 12px; color: #fff; }
-  #modalDesc { font-size: 18px; color: #cbd5e1; max-width: 900px; max-height: 140px; overflow: hidden; margin-bottom: 24px; line-height: 1.4; }
-  .stream-btn { display: block; width: 520px; padding: 14px 20px; margin-bottom: 12px; background: #1e293b; color: #fff; font-size: 20px; border-radius: 6px; border: 3px solid transparent; text-align: left; cursor: pointer; }
+  #modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(5,8,15,0.95); padding: 36px 56px; z-index: 50; overflow-y: auto; }
+  #modalTitle { font-size: 30px; font-weight: bold; margin-bottom: 10px; color: #fff; }
+  #modalDesc { font-size: 17px; color: #cbd5e1; max-width: 920px; max-height: 110px; overflow: hidden; margin-bottom: 18px; line-height: 1.4; }
+  #seriesControls { display: none; margin-bottom: 16px; }
+  .ep-btn { display: inline-block; padding: 8px 16px; margin: 0 8px 8px 0; background: #1e293b; color: #fff; font-size: 18px; border-radius: 6px; border: 3px solid transparent; cursor: pointer; }
+  .ep-btn.active { background: #2563eb; }
+  .stream-btn { display: block; width: 540px; padding: 13px 20px; margin-bottom: 10px; background: #1e293b; color: #fff; font-size: 20px; border-radius: 6px; border: 3px solid transparent; text-align: left; cursor: pointer; }
   #playerWrap { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #000; z-index: 100; }
   video { width: 100%; height: 100%; }
-  #playerHud { position: fixed; top: 20px; left: 30px; background: rgba(0,0,0,0.7); padding: 10px 18px; border-radius: 6px; font-size: 20px; color: #facc15; z-index: 101; }
+  #playerHud { position: fixed; top: 20px; left: 30px; background: rgba(0,0,0,0.75); padding: 10px 18px; border-radius: 6px; font-size: 20px; color: #facc15; z-index: 101; }
 </style>
 </head>
 <body>
@@ -216,8 +228,17 @@ const TV_UI_HTML = `<!DOCTYPE html>
 <div id="modal">
   <div id="modalTitle">Загрузка...</div>
   <div id="modalDesc"></div>
+  <div id="seriesControls">
+    <span class="ep-btn" data-act="prevSeason">◀ Сезон</span>
+    <span id="seasonLabel" style="font-size:20px;font-weight:bold;margin:0 10px;">Сезон 1</span>
+    <span class="ep-btn" data-act="nextSeason">Сезон ▶</span>
+    <span style="margin-left:20px;"></span>
+    <span class="ep-btn" data-act="prevEp">◀ Серия</span>
+    <span id="epLabel" style="font-size:20px;font-weight:bold;margin:0 10px;">Серия 1</span>
+    <span class="ep-btn" data-act="nextEp">Серия ▶</span>
+  </div>
   <div id="streamList"></div>
-  <button class="stream-btn" data-act="closeModal" style="background:#334155;margin-top:20px;">← Назад (Return)</button>
+  <button class="stream-btn" data-act="closeModal" style="background:#334155;margin-top:16px;">← Назад (Return)</button>
 </div>
 
 <div id="playerWrap">
@@ -232,6 +253,10 @@ var currentPage = 1;
 var itemsCache = [];
 var focusables = [];
 var focusIdx = 0;
+var activeItem = null;
+var curSeason = 1;
+var curEp = 1;
+var hlsInstance = null;
 
 function setStatus(t) { document.getElementById("status").innerText = t; }
 
@@ -267,8 +292,10 @@ function refreshFocus(resetToGrid) {
     return;
   }
   if (document.getElementById("modal").style.display === "block") {
-    var btns = document.getElementById("modal").querySelectorAll(".stream-btn");
-    for (var i = 0; i < btns.length; i++) list.push(btns[i]);
+    var mbtns = document.getElementById("modal").querySelectorAll(".ep-btn, .stream-btn");
+    for (var i = 0; i < mbtns.length; i++) {
+      if (mbtns[i].offsetParent !== null) list.push(mbtns[i]);
+    }
   } else {
     var tabs = document.querySelectorAll(".tab");
     for (var i = 0; i < tabs.length; i++) list.push(tabs[i]);
@@ -341,32 +368,26 @@ function loadTab(tab, page) {
   });
 }
 
-function openItem(it) {
-  if (it.type === "tv" && it.url) {
-    playVideo(it.title, it.url);
-    return;
-  }
-  var modal = document.getElementById("modal");
-  modal.style.display = "block";
-  document.getElementById("modalTitle").innerText = it.title;
-  document.getElementById("modalDesc").innerText = "Получаем ссылки с HDRezka...";
-  document.getElementById("streamList").innerHTML = "";
-  focusIdx = 0;
-  refreshFocus(false);
-
-  xhrGet(ORIGIN + "/resolve?rezkaUrl=" + encodeURIComponent(it.rezkaUrl) + "&title=" + encodeURIComponent(it.title), function(err, data) {
+function fetchStreamsForModal() {
+  if (!activeItem) return;
+  document.getElementById("seasonLabel").innerText = "Сезон " + curSeason;
+  document.getElementById("epLabel").innerText = "Серия " + curEp;
+  document.getElementById("streamList").innerHTML = '<div style="color:#94a3b8;font-size:18px;">Загружаем потоки...</div>';
+  var q = ORIGIN + "/resolve?rezkaUrl=" + encodeURIComponent(activeItem.rezkaUrl) + "&title=" + encodeURIComponent(activeItem.title) + "&s=" + curSeason + "&e=" + curEp;
+  xhrGet(q, function(err, data) {
     if (err || !data) {
       document.getElementById("modalDesc").innerText = "Ошибка загрузки потоков.";
       return;
     }
-    document.getElementById("modalDesc").innerText = data.desc || "";
+    if (data.desc) document.getElementById("modalDesc").innerText = data.desc;
+    document.getElementById("seriesControls").style.display = data.isSeries ? "block" : "none";
     var streams = data.streams || [];
     if (!streams.length) {
-      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">Потоки не найдены</div>';
+      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">Потоки не найдены (попробуйте другую серию/сезон)</div>';
     } else {
       var h = "";
       for (var i = 0; i < streams.length; i++) {
-        h += '<button class="stream-btn" data-url="' + streams[i].url + '" data-name="' + it.title + ' (' + streams[i].quality + ')">▶ ' + streams[i].name + '</button>';
+        h += '<button class="stream-btn" data-url="' + streams[i].url + '" data-hls="' + (streams[i].isHls ? '1' : '0') + '" data-name="' + activeItem.title + ' (' + streams[i].quality + ')">▶ ' + streams[i].name + '</button>';
       }
       document.getElementById("streamList").innerHTML = h;
     }
@@ -375,18 +396,45 @@ function openItem(it) {
   });
 }
 
-function playVideo(title, url) {
+function openItem(it) {
+  if (it.type === "tv" && it.url) {
+    playVideo(it.title, it.url, true);
+    return;
+  }
+  activeItem = it;
+  curSeason = 1;
+  curEp = 1;
+  var modal = document.getElementById("modal");
+  modal.style.display = "block";
+  document.getElementById("modalTitle").innerText = it.title;
+  document.getElementById("modalDesc").innerText = "Получаем данные с HDRezka...";
+  document.getElementById("seriesControls").style.display = "none";
+  fetchStreamsForModal();
+}
+
+function playVideo(title, url, forceHls) {
   var wrap = document.getElementById("playerWrap");
   var vid = document.getElementById("vid");
   document.getElementById("playerHud").innerText = title + " (Назад — выход)";
   wrap.style.display = "block";
-  vid.src = url;
-  vid.play();
+
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+
+  if (forceHls && window.Hls && Hls.isSupported()) {
+    hlsInstance = new Hls();
+    hlsInstance.loadSource(url);
+    hlsInstance.attachMedia(vid);
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() { vid.play(); });
+  } else {
+    vid.src = url;
+    vid.play();
+  }
 }
 
 function stopVideo() {
   var wrap = document.getElementById("playerWrap");
   var vid = document.getElementById("vid");
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
   vid.pause();
   vid.src = "";
   wrap.style.display = "none";
@@ -413,10 +461,14 @@ function activateElement(el) {
   if (act === "clear") { inp.value = ""; return; }
   if (act === "nextPage") { loadTab(currentTab, currentPage + 1); return; }
   if (act === "closeModal") { document.getElementById("modal").style.display = "none"; refreshFocus(false); return; }
+  if (act === "prevSeason") { if (curSeason > 1) { curSeason--; curEp = 1; fetchStreamsForModal(); } return; }
+  if (act === "nextSeason") { curSeason++; curEp = 1; fetchStreamsForModal(); return; }
+  if (act === "prevEp") { if (curEp > 1) { curEp--; fetchStreamsForModal(); } return; }
+  if (act === "nextEp") { curEp++; fetchStreamsForModal(); return; }
   var ch = el.getAttribute("data-ch");
   if (ch) { inp.value += ch; return; }
   var sUrl = el.getAttribute("data-url");
-  if (sUrl) { playVideo(el.getAttribute("data-name"), sUrl); return; }
+  if (sUrl) { playVideo(el.getAttribute("data-name"), sUrl, el.getAttribute("data-hls") === "1"); return; }
   var idx = el.getAttribute("data-idx");
   if (idx !== null) { openItem(itemsCache[parseInt(idx, 10)]); }
 }
@@ -493,17 +545,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(TV_UI_HTML);
   }
-if (path === "/debug-stream") {
-    const s = await rezkaRequest("/films/?filter=popular");
-    const cards = parseCards(s.text, origin, "movie");
-    const first = cards[0];
-    const page = first ? await rezkaRequest(first.rezkaUrl) : { text: "" };
-    const st = page.text.match(/"streams"\s*:\s*"([^"]+)"/);
-    const init = page.text.match(/initCDN(Movies|Series)Events\([^)]+\)/);
-    const decoded = st ? decodeRezkaStreams(st[1]) : "НЕТ streams в HTML";
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    return res.end(`Фильм: ${first ? first.title : "-"}\ninitCDN: ${init ? init[0] : "НЕТ"}\nDecoded:\n${decoded}`);
-  }
+
   if (path === "/tv") {
     const sources = [
       "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_russia.m3u8",
@@ -566,6 +608,8 @@ if (path === "/debug-stream") {
 
   if (path === "/resolve") {
     const title = reqUrl.searchParams.get("title") || "";
+    const season = reqUrl.searchParams.get("s") || "1";
+    const episode = reqUrl.searchParams.get("e") || "1";
     let pageUrl = reqUrl.searchParams.get("rezkaUrl") || "";
 
     if (!pageUrl && title) {
@@ -581,36 +625,44 @@ if (path === "/debug-stream") {
     const descM = r.text.match(/<div class="b-post__description_text">([\s\S]*?)<\/div>/);
     const desc = descM ? descM[1].replace(/<[^>]+>/g, "").trim() : "";
 
+    let isSeries = false;
     let streams = [];
     const streamM = r.text.match(/"streams"\s*:\s*"([^"]+)"/);
     if (streamM) streams = parseStreams(decodeRezkaStreams(streamM[1]), origin);
 
-    if (streams.length === 0) {
-      const initM = r.text.match(/initCDN(Movies|Series)Events\(\s*(\d+)\s*,\s*(\d+)/);
-      if (initM) {
-        const isSeries = initM[1] === "Series";
+    const initM = r.text.match(/initCDN(Movies|Series)Events\(\s*(\d+)\s*,\s*(\d+)/);
+    if (initM) {
+      isSeries = initM[1] === "Series";
+      if (streams.length === 0 || isSeries) {
         const body = new URLSearchParams({
           id: initM[2],
           translator_id: initM[3],
           action: isSeries ? "get_stream" : "get_movie"
         });
-        if (isSeries) { body.set("season", "1"); body.set("episode", "1"); }
+        if (isSeries) {
+          body.set("season", season);
+          body.set("episode", episode);
+        }
 
         const aRes = await rezkaRequest(`/ajax/get_cdn_series/?t=${Date.now()}`, {
           method: "POST",
           headers: {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest"
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": pageUrl.startsWith("http") ? pageUrl : r.base + pageUrl
           },
           body: body.toString()
         });
         try {
           const aData = JSON.parse(aRes.text);
-          if (aData && aData.url) streams = parseStreams(decodeRezkaStreams(aData.url), origin);
+          if (aData && aData.url) {
+            const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
+            if (parsed.length > 0) streams = parsed;
+          }
         } catch (e) {}
       }
     }
-    return sendJson({ streams, desc });
+    return sendJson({ streams, desc, isSeries });
   }
 
   if (path === "/proxy") {
