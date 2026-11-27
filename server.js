@@ -639,6 +639,7 @@ const server = http.createServer(async (req, res) => {
 
     let isSeries = false;
     let streams = [];
+    let lastAjax = "нет initCDN";
     const streamM = r.text.match(/"streams"\s*:\s*"([^"]+)"/);
     if (streamM) streams = parseStreams(decodeRezkaStreams(streamM[1]), origin);
 
@@ -654,7 +655,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (streams.length === 0 || isSeries) {
-        for (const tid of trIds.slice(0, 4)) {
+        for (const tid of trIds.slice(0, 6)) {
           const body = new URLSearchParams({
             id: postId,
             translator_id: tid,
@@ -678,6 +679,7 @@ const server = http.createServer(async (req, res) => {
             },
             body: body.toString()
           });
+          lastAjax = aRes.text.slice(0, 260);
           try {
             const aData = JSON.parse(aRes.text);
             if (aData && aData.url) {
@@ -691,7 +693,11 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    return sendJson({ streams, desc, isSeries });
+    return sendJson({
+      streams,
+      desc: streams.length ? desc : `AJAX: ${lastAjax} | ${desc}`,
+      isSeries
+    });
   }
 
   if (path === "/proxy") {
