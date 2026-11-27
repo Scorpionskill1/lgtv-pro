@@ -8,9 +8,10 @@ const MIRRORS = ["https://rezka.ag", "https://hdrezka.me", "https://rezka-ua.tv"
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 const cookieStore = {};
-let ruProxyPool = [];
-let ruPoolUpdatedAt = 0;
-let activeRuProxy = null;
+let cisProxyPool = [];
+let poolUpdatedAt = 0;
+let activeProxy = null; // { type: 'socks5'|'http', addr: 'ip:port', mirror: 'https://...', cookies: {} }
+let isHunting = false;
 
 function mergeCookies(base, rawSetCookies) {
   if (!cookieStore[base]) cookieStore[base] = {};
@@ -62,50 +63,67 @@ function solveAnubis(html) {
   return null;
 }
 
-// Загрузка актуального списка российских прокси из открытых источников
-async function refreshRuProxyPool(force = false) {
-  if (!force && ruProxyPool.length > 0 && Date.now() - ruPoolUpdatedAt < 15 * 60 * 1000) {
-    return ruProxyPool;
+// Загрузка свежих SOCKS5 и HTTP прокси по странам СНГ (RU, KZ, BY, UA)
+async function refreshCisProxyPool(force = false) {
+  if (!force && cisProxyPool.length > 0 && Date.now() - poolUpdatedAt < 15 * 60 * 1000) {
+    return cisProxyPool;
   }
   const sources = [
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/RU/data.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt"
+    { type: "socks5", url: "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/RU/data.txt" },
+    { type: "socks5", url: "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/KZ/data.txt" },
+    { type: "socks5", url: "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/BY/data.txt" },
+    { type: "socks5", url: "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/UA/data.txt" },
+    { type: "http", url: "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/RU/data.txt" },
+    { type: "socks5", url: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt" }
   ];
-  const found = new Set();
+
+  const found = [];
+  const seen = new Set();
   const results = await Promise.allSettled(
-    sources.map((u) => fetch(u, { headers: { "User-Agent": UA } }).then((r) => (r.ok ? r.text() : "")))
+    sources.map((s) => fetch(s.url, { headers: { "User-Agent": UA } }).then((r) => (r.ok ? r.text() : "")))
   );
+
   for (let i = 0; i < results.length; i++) {
     if (results[i].status !== "fulfilled" || !results[i].value) continue;
+    const defaultType = sources[i].type;
     for (const raw of results[i].value.split(/\r?\n/)) {
-      const line = raw.trim().replace(/^https?:\/\//i, "");
-      if (/^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(line)) {
-        found.add(line);
+      const line = raw.trim();
+      if (!line) continue;
+      let pType = defaultType;
+      let addr = line;
+      if (/^socks5:\/\//i.test(line)) { pType = "socks5"; addr = line.replace(/^socks5:\/\//i, ""); }
+      else if (/^https?:\/\//i.test(line)) { pType = "http"; addr = line.replace(/^https?:\/\//i, ""); }
+
+      if (/^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(addr)) {
+        const key = `${pType}://${addr}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          found.push({ type: pType, addr });
+        }
       }
     }
   }
-  const arr = Array.from(found);
-  // Перемешиваем список, чтобы не упираться в одни и те же мёртвые IP
-  for (let i = arr.length - 1; i > 0; i--) {
+
+  // Перемешиваем, но приоритет отдаём странам СНГ (первые 4 источника)
+  const cisOnly = found.filter((_, idx) => idx < 600);
+  for (let i = cisOnly.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+    [cisOnly[i], cisOnly[j]] = [cisOnly[j], cisOnly[i]];
   }
-  if (arr.length > 0) {
-    ruProxyPool = arr;
-    ruPoolUpdatedAt = Date.now();
+  if (cisOnly.length > 0) {
+    cisProxyPool = cisOnly;
+    poolUpdatedAt = Date.now();
   }
-  return ruProxyPool;
+  return cisProxyPool;
 }
 
-// HTTPS-запрос через HTTP CONNECT прокси без внешних библиотек
-function fetchViaHttpProxy(targetUrl, proxyAddr, opts = {}, timeoutMs = 6500) {
+// Нативный HTTPS-клиент через SOCKS5 или HTTP CONNECT без внешних зависимостей
+function fetchViaProxy(targetUrl, proxyObj, opts = {}, timeoutMs = 5500) {
   return new Promise((resolve, reject) => {
     const u = new URL(targetUrl);
     const targetHost = u.hostname;
     const targetPort = u.port ? parseInt(u.port, 10) : 443;
-    const [pHost, pPortStr] = proxyAddr.split(":");
+    const [pHost, pPortStr] = proxyObj.addr.split(":");
     const pPort = parseInt(pPortStr, 10);
 
     let settled = false;
@@ -125,27 +143,7 @@ function fetchViaHttpProxy(targetUrl, proxyAddr, opts = {}, timeoutMs = 6500) {
 
     socket.on("error", (err) => done(err));
 
-    socket.on("connect", () => {
-      socket.write(
-        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-        `Host: ${targetHost}:${targetPort}\r\n` +
-        `Proxy-Connection: Keep-Alive\r\n\r\n`
-      );
-    });
-
-    let connectBuf = Buffer.alloc(0);
-    const onConnectData = (chunk) => {
-      connectBuf = Buffer.concat([connectBuf, chunk]);
-      const idx = connectBuf.indexOf("\r\n\r\n");
-      if (idx === -1) return;
-
-      socket.removeListener("data", onConnectData);
-      const head = connectBuf.slice(0, idx).toString("latin1");
-      if (!/^HTTP\/1\.[01] 200/i.test(head)) {
-        socket.destroy();
-        return done(new Error("CONNECT failed"));
-      }
-
+    const startTlsAndHttp = () => {
       const tlsSock = tls.connect({
         socket,
         servername: targetHost,
@@ -168,9 +166,7 @@ function fetchViaHttpProxy(targetUrl, proxyAddr, opts = {}, timeoutMs = 6500) {
         if (bodyBuf) headers["Content-Length"] = bodyBuf.length;
 
         let reqRaw = `${method} ${pathWithQuery} HTTP/1.1\r\n`;
-        for (const [k, v] of Object.entries(headers)) {
-          reqRaw += `${k}: ${v}\r\n`;
-        }
+        for (const [k, v] of Object.entries(headers)) reqRaw += `${k}: ${v}\r\n`;
         reqRaw += "\r\n";
 
         tlsSock.write(reqRaw);
@@ -220,7 +216,54 @@ function fetchViaHttpProxy(targetUrl, proxyAddr, opts = {}, timeoutMs = 6500) {
       });
     };
 
-    socket.on("data", onConnectData);
+    if (proxyObj.type === "socks5") {
+      let step = 0;
+      let buf = Buffer.alloc(0);
+      socket.on("connect", () => {
+        socket.write(Buffer.from([0x05, 0x01, 0x00]));
+      });
+      const onSocksData = (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (step === 0 && buf.length >= 2) {
+          if (buf[0] !== 0x05 || buf[1] !== 0x00) {
+            socket.destroy();
+            return done(new Error("SOCKS5 auth failed"));
+          }
+          buf = buf.slice(2);
+          step = 1;
+          const hostBuf = Buffer.from(targetHost, "ascii");
+          const portBuf = Buffer.alloc(2);
+          portBuf.writeUInt16BE(targetPort, 0);
+          socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]), hostBuf, portBuf]));
+        } else if (step === 1 && buf.length >= 7) {
+          if (buf[1] !== 0x00) {
+            socket.destroy();
+            return done(new Error("SOCKS5 connect rejected"));
+          }
+          socket.removeListener("data", onSocksData);
+          startTlsAndHttp();
+        }
+      };
+      socket.on("data", onSocksData);
+    } else {
+      let connectBuf = Buffer.alloc(0);
+      socket.on("connect", () => {
+        socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+      });
+      const onHttpData = (chunk) => {
+        connectBuf = Buffer.concat([connectBuf, chunk]);
+        const idx = connectBuf.indexOf("\r\n\r\n");
+        if (idx === -1) return;
+        socket.removeListener("data", onHttpData);
+        const head = connectBuf.slice(0, idx).toString("latin1");
+        if (!/^HTTP\/1\.[01] 200/i.test(head)) {
+          socket.destroy();
+          return done(new Error("HTTP CONNECT failed"));
+        }
+        startTlsAndHttp();
+      };
+      socket.on("data", onHttpData);
+    }
   });
 }
 
@@ -276,99 +319,124 @@ async function rezkaRequest(path, opts = {}) {
   return { text: "", base: MIRRORS[0], ok: false };
 }
 
-// Запрос потока через живой российский прокси с автоперебором при отказе
-async function fetchStreamsViaRuProxy(base, pageUrl, postParams, origin) {
-  const trySingleProxy = async (proxyAddr) => {
-    const fullPageUrl = pageUrl.startsWith("http") ? pageUrl : base + pageUrl;
-    const localJar = {};
-    const addLocalCookies = (arr) => {
-      for (const item of arr || []) {
-        const pair = item.split(";")[0].trim();
-        const eq = pair.indexOf("=");
-        if (eq > 0) localJar[pair.slice(0, eq)] = pair.slice(eq + 1);
-      }
-    };
-    const localCookieStr = () => Object.entries(localJar).map(([k, v]) => `${k}=${v}`).join("; ");
-
-    // 1. Открываем страницу фильма через прокси, чтобы получить свежую RU-сессию и favs
-    let pRes = await fetchViaHttpProxy(fullPageUrl, proxyAddr, {
-      headers: { Referer: base + "/" }
-    }, 6000);
-    addLocalCookies(pRes.setCookies);
-
-    if (pRes.text.includes("anubis_challenge")) {
-      const solved = solveAnubis(pRes.text);
-      if (!solved) throw new Error("Anubis fail");
-      const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(fullPageUrl)}&elapsedTime=${solved.elapsedTime}`;
-      const passRes = await fetchViaHttpProxy(passUrl, proxyAddr, {
-        headers: { Referer: fullPageUrl, ...(localCookieStr() ? { Cookie: localCookieStr() } : {}) }
-      }, 6000);
-      addLocalCookies(passRes.setCookies);
-
-      pRes = await fetchViaHttpProxy(fullPageUrl, proxyAddr, {
-        headers: { Referer: base + "/", ...(localCookieStr() ? { Cookie: localCookieStr() } : {}) }
-      }, 6000);
-      addLocalCookies(pRes.setCookies);
+// Выполнение запроса потока на конкретном прокси
+async function runResolveOnProxy(proxyObj, base, pageUrl, postParams, origin) {
+  const fullPageUrl = pageUrl.startsWith("http") ? pageUrl : base + pageUrl;
+  const localJar = {};
+  const addLocalCookies = (arr) => {
+    for (const item of arr || []) {
+      const pair = item.split(";")[0].trim();
+      const eq = pair.indexOf("=");
+      if (eq > 0) localJar[pair.slice(0, eq)] = pair.slice(eq + 1);
     }
-
-    const favM = pRes.text.match(/id="ctrl_favs"[^>]+value="([^"]+)"/i) || pRes.text.match(/value="([^"]+)"[^>]+id="ctrl_favs"/i);
-    const favs = favM ? favM[1] : postParams.favs || "";
-
-    // 2. Делаем POST-запрос за видеопотоком с российского IP
-    const body = new URLSearchParams({
-      id: postParams.id,
-      translator_id: postParams.translator_id,
-      is_camrip: "0",
-      is_ads: "0",
-      is_director: "0",
-      favs: favs,
-      action: postParams.isSeries ? "get_stream" : "get_movie"
-    });
-    if (postParams.isSeries) {
-      body.set("season", postParams.season);
-      body.set("episode", postParams.episode);
-    }
-
-    const aRes = await fetchViaHttpProxy(`${base}/ajax/get_cdn_series/?t=${Date.now()}`, proxyAddr, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": base,
-        "Referer": fullPageUrl,
-        ...(localCookieStr() ? { Cookie: localCookieStr() } : {})
-      },
-      body: body.toString()
-    }, 6000);
-
-    const aData = JSON.parse(aRes.text);
-    if (aData && aData.url) {
-      const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
-      if (parsed.length > 0) return parsed;
-    }
-    throw new Error("Empty or geo-blocked proxy");
   };
+  const localCookieStr = () => Object.entries(localJar).map(([k, v]) => `${k}=${v}`).join("; ");
 
-  // Сначала пробуем последний рабочий прокси из кэша
-  if (activeRuProxy) {
+  let pRes = await fetchViaProxy(fullPageUrl, proxyObj, {
+    headers: { Referer: base + "/" }
+  }, 5500);
+  addLocalCookies(pRes.setCookies);
+
+  if (pRes.text.includes("anubis_challenge")) {
+    const solved = solveAnubis(pRes.text);
+    if (!solved) throw new Error("Anubis fail");
+    const passUrl = `${base}/.within.website/x/cmd/anubis/api/pass-challenge?id=${encodeURIComponent(solved.id)}&response=${solved.response}&nonce=${solved.nonce}&redir=${encodeURIComponent(fullPageUrl)}&elapsedTime=${solved.elapsedTime}`;
+    const passRes = await fetchViaProxy(passUrl, proxyObj, {
+      headers: { Referer: fullPageUrl, ...(localCookieStr() ? { Cookie: localCookieStr() } : {}) }
+    }, 5500);
+    addLocalCookies(passRes.setCookies);
+
+    pRes = await fetchViaProxy(fullPageUrl, proxyObj, {
+      headers: { Referer: base + "/", ...(localCookieStr() ? { Cookie: localCookieStr() } : {}) }
+    }, 5500);
+    addLocalCookies(pRes.setCookies);
+  }
+
+  const favM = pRes.text.match(/id="ctrl_favs"[^>]+value="([^"]+)"/i) || pRes.text.match(/value="([^"]+)"[^>]+id="ctrl_favs"/i);
+  const favs = favM ? favM[1] : postParams.favs || "";
+
+  const body = new URLSearchParams({
+    id: postParams.id,
+    translator_id: postParams.translator_id,
+    is_camrip: "0",
+    is_ads: "0",
+    is_director: "0",
+    favs: favs,
+    action: postParams.isSeries ? "get_stream" : "get_movie"
+  });
+  if (postParams.isSeries) {
+    body.set("season", postParams.season);
+    body.set("episode", postParams.episode);
+  }
+
+  const aRes = await fetchViaProxy(`${base}/ajax/get_cdn_series/?t=${Date.now()}`, proxyObj, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": base,
+      "Referer": fullPageUrl,
+      ...(localCookieStr() ? { Cookie: localCookieStr() } : {})
+    },
+    body: body.toString()
+  }, 5500);
+
+  const aData = JSON.parse(aRes.text);
+  if (aData && aData.url) {
+    const parsed = parseStreams(decodeRezkaStreams(aData.url), origin);
+    if (parsed.length > 0) return parsed;
+  }
+  throw new Error("Blocked or empty");
+}
+
+// Фоновый охотник за живыми прокси СНГ — всегда держит рабочий прокси наготове
+async function huntWorkingProxy() {
+  if (isHunting || activeProxy) return;
+  isHunting = true;
+  try {
+    const pool = await refreshCisProxyPool(false);
+    const testParams = { id: "387", translator_id: "56", favs: "", isSeries: false };
+    for (let offset = 0; offset < Math.min(pool.length, 120); offset += 10) {
+      if (activeProxy) break;
+      const batch = pool.slice(offset, offset + 10);
+      try {
+        const winner = await Promise.any(
+          batch.map(async (p) => {
+            await runResolveOnProxy(p, "https://rezka.ag", "/films/drama/387-pobeg-iz-shoushenka-1994.html", testParams, "http://localhost");
+            return p;
+          })
+        );
+        if (winner) {
+          activeProxy = winner;
+          console.log("Found working CIS proxy:", winner.type, winner.addr);
+          break;
+        }
+      } catch (e) {}
+    }
+  } finally {
+    isHunting = false;
+  }
+}
+
+async function fetchStreamsViaCisProxy(base, pageUrl, postParams, origin) {
+  if (activeProxy) {
     try {
-      return await trySingleProxy(activeRuProxy);
+      return await runResolveOnProxy(activeProxy, base, pageUrl, postParams, origin);
     } catch (e) {
-      activeRuProxy = null;
+      activeProxy = null;
     }
   }
 
-  // Если кэш пуст или прокси умер — качаем свежий список и проверяем пачками по 6 штук
-  let pool = await refreshRuProxyPool(false);
-  if (!pool.length) pool = await refreshRuProxyPool(true);
+  let pool = await refreshCisProxyPool(false);
+  if (!pool.length) pool = await refreshCisProxyPool(true);
 
-  for (let offset = 0; offset < Math.min(pool.length, 36); offset += 6) {
-    const batch = pool.slice(offset, offset + 6);
+  for (let offset = 0; offset < Math.min(pool.length, 60); offset += 10) {
+    const batch = pool.slice(offset, offset + 10);
     try {
       const winner = await Promise.any(
-        batch.map(async (proxyAddr) => {
-          const streams = await trySingleProxy(proxyAddr);
-          activeRuProxy = proxyAddr;
+        batch.map(async (p) => {
+          const streams = await runResolveOnProxy(p, base, pageUrl, postParams, origin);
+          activeProxy = p;
           return streams;
         })
       );
@@ -376,6 +444,7 @@ async function fetchStreamsViaRuProxy(base, pageUrl, postParams, origin) {
     } catch (e) {}
   }
 
+  huntWorkingProxy().catch(() => {});
   return [];
 }
 
@@ -432,7 +501,7 @@ function parseCards(html, origin, catType) {
   const chunks = html.split('<div class="b-content__inline_item"');
   const items = [];
   for (let i = 1; i < chunks.length; i++) {
-    const c = chunks[i];
+    const c = chunks[i].split('</div> </div>')[0];
     const idM = c.match(/data-id="(\d+)"/);
     const urlM = c.match(/data-url="([^"]+)"/);
     const imgM = c.match(/<img[^>]+src="([^"]+)"/);
@@ -646,7 +715,7 @@ function loadTab(tab, page) {
   var url = tab === "tv" ? (ORIGIN + "/tv") : (ORIGIN + "/catalog?type=" + tab + "&page=" + currentPage);
   xhrGet(url, function(err, data) {
     if (err) { setStatus("Ошибка сети"); return; }
-    setStatus("Готово");
+    setStatus(data.proxyReady ? "Готово (СНГ-шлюз активен)" : "Готово (поиск СНГ-шлюза...)");
     renderCards(tab === "tv" ? data.channels : data.items, tab === "tv");
   });
 }
@@ -655,7 +724,7 @@ function fetchStreamsForModal() {
   if (!activeItem) return;
   document.getElementById("seasonLabel").innerText = "Сезон " + curSeason;
   document.getElementById("epLabel").innerText = "Серия " + curEp;
-  document.getElementById("streamList").innerHTML = '<div style="color:#94a3b8;font-size:18px;">Подбираем живой РФ-прокси и ищем потоки (до 10 сек)...</div>';
+  document.getElementById("streamList").innerHTML = '<div style="color:#94a3b8;font-size:18px;">Загружаем прямые потоки HDRezka через СНГ-шлюз...</div>';
   var q = ORIGIN + "/resolve?rezkaUrl=" + encodeURIComponent(activeItem.rezkaUrl) + "&title=" + encodeURIComponent(activeItem.title) + "&s=" + curSeason + "&e=" + curEp;
   xhrGet(q, function(err, data) {
     if (err || !data) {
@@ -666,7 +735,7 @@ function fetchStreamsForModal() {
     document.getElementById("seriesControls").style.display = data.isSeries ? "block" : "none";
     var streams = data.streams || [];
     if (!streams.length) {
-      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">Свободные РФ-прокси сейчас заняты. Нажмите «Назад» и откройте фильм ещё раз.</div>';
+      document.getElementById("streamList").innerHTML = '<div style="color:#f87171;font-size:20px;">СНГ-шлюз обновляется. Подождите 10 сек и нажмите «Назад» → откройте снова.</div>';
     } else {
       var h = "";
       for (var i = 0; i < streams.length; i++) {
@@ -872,21 +941,21 @@ const server = http.createServer(async (req, res) => {
       }
     }
     channels.sort((a, b) => (b.isHd ? 1 : 0) - (a.isHd ? 1 : 0));
-    return sendJson({ channels: channels.slice(0, 160) });
+    return sendJson({ channels: channels.slice(0, 160), proxyReady: Boolean(activeProxy) });
   }
 
   if (path === "/catalog") {
     const cat = reqUrl.searchParams.get("type") === "series" ? "series" : "films";
     const page = parseInt(reqUrl.searchParams.get("page") || "1", 10) || 1;
     const r = await rezkaRequest(`/${cat}/${page > 1 ? `page/${page}/` : ""}?filter=popular`);
-    return sendJson({ items: parseCards(r.text, origin, cat) });
+    return sendJson({ items: parseCards(r.text, origin, cat), proxyReady: Boolean(activeProxy) });
   }
 
   if (path === "/search") {
     const q = (reqUrl.searchParams.get("q") || "").trim();
     if (!q) return sendJson({ items: [] });
     const r = await rezkaRequest(`/search/?do=search&subaction=search&q=${encodeURIComponent(q)}`);
-    return sendJson({ items: parseCards(r.text, origin, "movie") });
+    return sendJson({ items: parseCards(r.text, origin, "movie"), proxyReady: Boolean(activeProxy) });
   }
 
   if (path === "/resolve") {
@@ -921,7 +990,6 @@ const server = http.createServer(async (req, res) => {
       const postId = initM[2];
       const translatorId = initM[3];
 
-      // 1. Сначала пробуем напрямую (если сервер уже в РФ)
       if (streams.length === 0 || isSeries) {
         const body = new URLSearchParams({
           id: postId,
@@ -954,9 +1022,8 @@ const server = http.createServer(async (req, res) => {
         } catch (e) {}
       }
 
-      // 2. Если прямой запрос вернул пустоту (геоблок США) — автоматически подбираем живой РФ-прокси
       if (streams.length === 0) {
-        streams = await fetchStreamsViaRuProxy(
+        streams = await fetchStreamsViaCisProxy(
           r.base,
           pageUrl,
           { id: postId, translator_id: translatorId, favs, isSeries, season, episode },
@@ -1038,5 +1105,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("LG TV Gateway listening on port " + PORT);
-  refreshRuProxyPool(true).catch(() => {});
+  huntWorkingProxy().catch(() => {});
+  setInterval(() => { huntWorkingProxy().catch(() => {}); }, 2 * 60 * 1000);
 });
