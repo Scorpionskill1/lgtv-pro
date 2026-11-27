@@ -182,6 +182,60 @@ function parseCards(html, origin, catType) {
   return items;
 }
 
+// Резервный поиск потоков через открытые балансеры СНГ (работает с американских IP Render)
+async function fallbackCisStreams(title, year, season, episode, origin) {
+  const streams = [];
+  const cleanTitle = title.split("/")[0].trim();
+
+  // 1. Поиск Kinopoisk ID через открытое API Kinobox
+  try {
+    const q = encodeURIComponent(cleanTitle + (year ? " " + year : ""));
+    const kbSearch = await fetch(`https://kinobox.tv/api/films/search?query=${q}`, {
+      headers: { "User-Agent": UA, "Referer": "https://kinobox.tv/" }
+    });
+    if (kbSearch.ok) {
+      const list = await kbSearch.json();
+      const hit = Array.isArray(list) ? list[0] : (list && list.data && list.data[0]);
+      const kpId = hit && (hit.id || hit.kinopoiskId);
+      if (kpId) {
+        const plRes = await fetch(`https://kinobox.tv/api/players?kinopoisk=${kpId}`, {
+          headers: { "User-Agent": UA, "Referer": "https://kinobox.tv/" }
+        });
+        if (plRes.ok) {
+          const players = await plRes.json();
+          if (Array.isArray(players)) {
+            for (const p of players) {
+              if (!p.iframeUrl) continue;
+              const iframeUrl = p.iframeUrl.startsWith("//") ? "https:" + p.iframeUrl : p.iframeUrl;
+              try {
+                const iRes = await fetch(iframeUrl, {
+                  headers: { "User-Agent": UA, "Referer": "https://kinobox.tv/" }
+                });
+                const iHtml = await iRes.text();
+                const m3u8 = iHtml.match(/https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*/i);
+                const mp4 = iHtml.match(/https?:\/\/[^"'\s\\]+\.mp4[^"'\s\\]*/i);
+                const found = (mp4 && mp4[0]) || (m3u8 && m3u8[0]);
+                if (found) {
+                  const cleanUrl = found.replace(/\\\//g, "/");
+                  streams.push({
+                    quality: "HD",
+                    isHls: cleanUrl.includes(".m3u8"),
+                    name: `${p.type || "CDN"} • HD (${cleanUrl.includes(".mp4") ? "MP4" : "HLS"})`,
+                    url: `${origin}/proxy?url=${encodeURIComponent(cleanUrl)}`
+                  });
+                }
+              } catch (e) {}
+              if (streams.length >= 3) break;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  return streams;
+}
+
 const TV_UI_HTML = `<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -382,8 +436,8 @@ function fetchStreamsForModal() {
   if (!activeItem) return;
   document.getElementById("seasonLabel").innerText = "Сезон " + curSeason;
   document.getElementById("epLabel").innerText = "Серия " + curEp;
-  document.getElementById("streamList").innerHTML = '<div style="color:#94a3b8;font-size:18px;">Загружаем потоки...</div>';
-  var q = ORIGIN + "/resolve?rezkaUrl=" + encodeURIComponent(activeItem.rezkaUrl) + "&title=" + encodeURIComponent(activeItem.title) + "&s=" + curSeason + "&e=" + curEp;
+  document.getElementById("streamList").innerHTML = '<div style="color:#94a3b8;font-size:18px;">Ищем потоки на балансерах...</div>';
+  var q = ORIGIN + "/resolve?rezkaUrl=" + encodeURIComponent(activeItem.rezkaUrl) + "&title=" + encodeURIComponent(activeItem.title) + "&year=" + encodeURIComponent(activeItem.year || "") + "&s=" + curSeason + "&e=" + curEp;
   xhrGet(q, function(err, data) {
     if (err || !data) {
       document.getElementById("modalDesc").innerText = "Ошибка загрузки потоков.";
@@ -417,7 +471,7 @@ function openItem(it) {
   var modal = document.getElementById("modal");
   modal.style.display = "block";
   document.getElementById("modalTitle").innerText = it.title;
-  document.getElementById("modalDesc").innerText = "Получаем данные с HDRezka...";
+  document.getElementById("modalDesc").innerText = "Получаем данные...";
   document.getElementById("seriesControls").style.display = "none";
   fetchStreamsForModal();
 }
@@ -618,6 +672,7 @@ const server = http.createServer(async (req, res) => {
 
   if (path === "/resolve") {
     const title = reqUrl.searchParams.get("title") || "";
+    const year = reqUrl.searchParams.get("year") || "";
     const season = reqUrl.searchParams.get("s") || "1";
     const episode = reqUrl.searchParams.get("e") || "1";
     let pageUrl = reqUrl.searchParams.get("rezkaUrl") || "";
@@ -639,7 +694,6 @@ const server = http.createServer(async (req, res) => {
 
     let isSeries = false;
     let streams = [];
-    let lastAjax = "нет initCDN";
     const streamM = r.text.match(/"streams"\s*:\s*"([^"]+)"/);
     if (streamM) streams = parseStreams(decodeRezkaStreams(streamM[1]), origin);
 
@@ -655,7 +709,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (streams.length === 0 || isSeries) {
-        for (const tid of trIds.slice(0, 6)) {
+        for (const tid of trIds.slice(0, 4)) {
           const body = new URLSearchParams({
             id: postId,
             translator_id: tid,
@@ -679,7 +733,6 @@ const server = http.createServer(async (req, res) => {
             },
             body: body.toString()
           });
-          lastAjax = aRes.text.slice(0, 260);
           try {
             const aData = JSON.parse(aRes.text);
             if (aData && aData.url) {
@@ -693,11 +746,13 @@ const server = http.createServer(async (req, res) => {
         }
       }
     }
-    return sendJson({
-      streams,
-      desc: streams.length ? desc : `AJAX: ${lastAjax} | ${desc}`,
-      isSeries
-    });
+
+    // Если HDRezka закрыла поток по геолокации США — забираем из СНГ-балансеров
+    if (streams.length === 0 && title) {
+      streams = await fallbackCisStreams(title, year, season, episode, origin);
+    }
+
+    return sendJson({ streams, desc, isSeries });
   }
 
   if (path === "/proxy") {
